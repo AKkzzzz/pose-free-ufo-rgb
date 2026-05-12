@@ -1,0 +1,831 @@
+# Copyright (C) 2026 Xiaomi Corporation.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied. See the License for the specific language governing
+# permissions and limitations under the License.
+
+import argparse
+import copy
+import datetime
+import json
+import logging
+import math
+import os
+import shutil
+import sys
+import time
+from ufo.utils.misc import update_scene
+
+import numpy as np
+import timm.optim.optim_factory as optim_factory
+import torch
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.utils.data
+from torch.utils.tensorboard import SummaryWriter  # Add TensorBoard import
+from einops import rearrange, repeat
+import torch.nn.functional as F
+# UFO imports
+import ufo.models as models
+import ufo.utils.distributed as distributed
+import ufo.utils.misc as misc
+from ufo.utils.engine import evaluate, evaluate_flow, visualize
+from ufo.dataset.constants import DATASET_DICT
+from ufo.dataset.data_utils import prepare_inputs_and_targets
+from ufo.dataset.samplers import InfiniteSampler, NoPaddingDistributedSampler
+from ufo.dataset.dataset import UFODataset, UFODatasetEval
+from ufo.utils.logging import MetricLogger, WandbLogger, setup_logging
+from ufo.utils.losses import compute_loss
+from ufo.utils.lpips_loss import RGBLpipsLoss
+from ufo.utils.misc import NativeScalerWithGradNormCount as NativeScaler
+from ufo.utils.misc import combine_dict_entries, project_boxes_to_image, convert_to_chunks
+from ipdb import iex
+from ufo.utils.misc import compute_point_visibility, compute_visible_topk_indices_any_view, batched_index_gather, batched_index_update
+from ufo.ar import val
+from typing import Dict, Any, Optional
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+cudnn.benchmark = True
+
+
+# ============================================================================
+# TENSORBOARD LOGGER
+# ============================================================================
+
+class TensorBoardLogger:
+    def __init__(
+        self,
+        log_dir: str,
+        comment: str = "",
+        *,
+        distributed: bool = True,     # only used to detect rank; no collectives are called
+        purge_step: Optional[int] = None,
+        flush_secs: int = 30,
+        max_queue: int = 1000,
+    ):
+        """
+        Rank-zero-only TensorBoard logger:
+        - No all_reduce / cross-rank sync.
+        - No barriers.
+        - Only rank 0 creates a SummaryWriter and writes events.
+        """
+        self.step = 0
+
+        # Figure out rank without synchronizing.
+        dist_inited = distributed and dist.is_available() and dist.is_initialized()
+        if dist_inited:
+            try:
+                rank = dist.get_rank()
+            except Exception:
+                rank = int(os.getenv("RANK", "0"))
+        else:
+            # fall back to env var or assume single-process
+            rank = int(os.getenv("RANK", "0")) if distributed else 0
+
+        self.rank = rank
+        self.is_master = (self.rank == 0)
+
+        # Only master prepares the log dir and writer
+        self.writer = None
+        if self.is_master:
+            os.makedirs(log_dir, exist_ok=True)
+            self.writer = SummaryWriter(
+                log_dir,
+                comment=comment,
+                purge_step=purge_step,
+                flush_secs=flush_secs,
+                max_queue=max_queue,
+            )
+
+    # ---------- public API ----------
+
+    def set_step(self, step: Optional[int] = None):
+        """Set the current step for logging."""
+        if step is not None:
+            self.step = int(step)
+        else:
+            self.step += 1
+
+    def update(
+        self,
+        metrics_dict: Dict[str, Any],
+        *,
+        step: Optional[int] = None,
+        **_: Any,  # ignore any old kwargs like reduce/sync
+    ):
+        """
+        Log metrics to TensorBoard (rank 0 only).
+        - Accepts nested dicts: {tag: value} or {group_tag: {sub: value, ...}}
+        - Values can be int/float or torch.Tensor; tensors become local scalars.
+        - No cross-rank reduction; values reflect rank 0 only.
+        """
+        if step is not None:
+            self.set_step(step)
+
+        if not (self.is_master and self.writer is not None):
+            return  # no-op on non-master ranks
+
+        flat_scalars, grouped_scalars = {}, {}
+
+        for key, value in metrics_dict.items():
+            if isinstance(value, dict):
+                sub = {}
+                for sk, sv in value.items():
+                    sval = self._to_scalar_local(sv)
+                    if sval is not None:
+                        sub[sk] = sval
+                if sub:
+                    grouped_scalars[key] = sub
+            else:
+                sval = self._to_scalar_local(value)
+                if sval is not None:
+                    flat_scalars[key] = sval
+
+        for k, v in flat_scalars.items():
+            self.writer.add_scalar(k, v, self.step)
+        for k, sub in grouped_scalars.items():
+            self.writer.add_scalars(k, sub, self.step)
+
+    def flush(self):
+        if self.is_master and self.writer is not None:
+            self.writer.flush()
+
+    def close(self):
+        if self.is_master and self.writer is not None:
+            self.writer.close()
+
+    # ---------- helpers ----------
+
+    def log_image(self, tag: str, imgCHW: torch.Tensor, step: Optional[int] = None, every: int = 1000):
+        """Log an image [C,H,W] in [0,1] from rank 0 only."""
+        if step is not None:
+            self.set_step(step)
+        if self.is_master and self.writer is not None and (self.step % every == 0):
+            self.writer.add_image(tag, imgCHW, self.step)
+
+    def log_hist(self, tag: str, tensor: torch.Tensor, step: Optional[int] = None, every: int = 100):
+        """Log a histogram from rank 0 only."""
+        if step is not None:
+            self.set_step(step)
+        if self.is_master and self.writer is not None and (self.step % every == 0):
+            self.writer.add_histogram(tag, tensor.detach().float().cpu().numpy(), self.step)
+
+    def _to_scalar_local(self, v: Any) -> Optional[float]:
+        """
+        Convert int/float/tensor to a local float scalar on the current rank.
+        No device moves beyond what's needed to read a scalar.
+        """
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, torch.Tensor):
+            t = v.detach()
+            if t.numel() == 0:
+                return None
+            t = t.float()
+            if t.numel() > 1:
+                t = t.mean()
+            # .item() will sync if t is on CUDA; that's fine on rank 0 only.
+            return float(t.item())
+        return None
+
+
+# ============================================================================
+# ARGUMENT PARSER
+# ============================================================================
+
+def get_args_parser():
+    parser = argparse.ArgumentParser("UFO training", add_help=False)
+
+    # =============== Configuration file ================= #
+    parser.add_argument("--config", type=str, default=None,
+                       help="Path to JSON config file (default: configs/default.json). CLI args override config values.")
+
+    # =============== Model parameters ================= #
+    parser.add_argument("--arch", default="small", type=str,
+                       help="Architecture type (e.g. 'small'). Selects which model class is built; "
+                            "see ufo/models/archs/ for available types.")
+    parser.add_argument("--model", default="UFO-B/8", type=str,
+                       help="Backbone size identifier within the chosen --arch (e.g. UFO-B/8, UFO-L/8).")
+    parser.add_argument("--num_context_timesteps", default=4, type=int)
+    parser.add_argument("--num_target_timesteps", default=4, type=int)
+    parser.add_argument("--gs_dim", default=3, type=int, help="Number of gs dimensions")
+    parser.add_argument("--use_sky_token", action="store_true")
+    parser.add_argument("--use_affine_token", action="store_true")
+    parser.add_argument("--use_latest_gsplat", action="store_true")
+    parser.add_argument(
+        "--decoder_type",
+        type=str,
+        choices=["dummy", "conv"],
+        default="dummy",
+    )
+    parser.add_argument("--num_motion_tokens", default=16, type=int, help="Number of motion tokens")
+    parser.add_argument("--filter_num", default=3600, type=int, help="Number of visible tokens to keep when filtering scene (k for top-k filtering)")
+
+    # =============== Losses =============== #
+    parser.add_argument("--enable_depth_loss", action="store_true")
+
+    # Option 1: push the sky depth to a fixed value
+    parser.add_argument("--enable_sky_depth_loss", action="store_true")
+    parser.add_argument("--sky_depth", type=float, default=300.0)
+    # Option 2: make sky gaussians transparent and use a sky token to represent sky
+    parser.add_argument("--enable_sky_opacity_loss", action="store_true")
+    parser.add_argument("--sky_opacity_loss_coeff", type=float, default=0.1)
+
+    # flow regularization loss
+    parser.add_argument("--enable_flow_reg_loss", action="store_true")
+    parser.add_argument("--flow_reg_coeff", type=float, default=0.005)
+
+    # lifespan regularization loss (enabled by default)
+    parser.add_argument("--enable_lifespan_reg_loss", type=bool, default=True,
+                        help="Enable L1 regularization on lifespan to encourage persistent Gaussians")
+    parser.add_argument("--lifespan_reg_coeff", type=float, default=1e-4,
+                        help="Coefficient for lifespan L1 regularization loss")
+
+    # perceptual loss
+    parser.add_argument("--enable_perceptual_loss", action="store_true")
+    parser.add_argument("--perceptual_weight", default=0.05, type=float, help="LPIPS weight")
+    parser.add_argument("--perceptual_loss_start_iter", default=5000, type=int)
+
+    # ============= Optimizer and LR parameters ============= #
+    parser.add_argument("--lr", type=float, default=4e-4, help="learning rate (absolute lr)")
+    parser.add_argument("--blr", type=float, default=8e-4, help="base learning rate")
+    parser.add_argument("--min_lr", type=float, default=0.0)
+    parser.add_argument("--lr_sched", type=str, default="cosine", choices=["constant", "cosine"])
+    parser.add_argument("--warmup_iters", type=int, default=5000, help="iters to warmup LR")
+    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--grad_clip", type=float, default=3.0, help="Gradient clip")
+    parser.add_argument("--disable_grad_checkpointing", action="store_true")
+
+    parser.add_argument("--start_iteration", default=0, type=int, help="start iteration")
+    parser.add_argument("--num_iterations", default=200_000, type=int, help="num of iterations")
+    parser.add_argument("--resume_from", default=None, help="resume from checkpoint")
+    parser.add_argument("--auto_resume", action="store_true")
+    parser.add_argument("--load_from", type=str, default=None)
+
+    # ============= Dataset parameters ============= #
+    parser.add_argument("--data_root", default="./data", type=str, help="dataset path")
+    parser.add_argument("--batch_size", default=8, type=int, help="Batch size per GPU")
+    parser.add_argument("--eval_batch_size", type=int, default=1)
+    parser.add_argument("--input_size", default=(160, 240), type=int, nargs=2)
+    parser.add_argument("--num_max_cameras", type=int, default=3)
+    parser.add_argument("--timespan", type=float, default=2.0)
+    parser.add_argument("--load_ground", action="store_true")
+    parser.add_argument("--load_depth", action="store_true")
+    parser.add_argument("--load_flow", action="store_true")
+    parser.add_argument("--dataset", default="waymo", type=str, choices=DATASET_DICT.keys())
+    parser.add_argument("--subset_ratio", default=1.0, type=float)
+    parser.add_argument("--num_workers", default=16, type=int)
+    parser.add_argument("--skip_sky_mask", action="store_true", help="skip sky mask loading")
+    # ============= Logging ============= #
+    parser.add_argument("--output_dir", default="./output")
+    parser.add_argument("--num_vis_samples", type=int, default=1)
+    parser.add_argument("--log_every_n_iters", type=int, default=50)
+    parser.add_argument("--vis_every_n_iters", type=int, default=5000)
+    parser.add_argument("--ckpt_every_n_iters", type=int, default=5000)
+    parser.add_argument("--eval_every_n_iters", type=int, default=50000)
+    parser.add_argument("--total_elapsed_time", type=float, default=0.0, help="total time elapsed")
+    parser.add_argument("--keep_n_ckpts", default=5, type=int)
+
+    # ============= Miscellaneous ============= #
+    parser.add_argument("--seed", default=1, type=int)
+    parser.add_argument("--device", default="cuda", help="device to use for training / testing")
+    parser.add_argument("--visualization_only", action="store_true")
+    parser.add_argument("--evaluate", action="store_true")
+
+    # ============= WandB and TensorBoard ============= #
+    parser.add_argument("--enable_wandb", action="store_true")
+    parser.add_argument("--enable_tensorboard", action="store_true", 
+                       help="Enable TensorBoard logging (default: True if wandb is not enabled)")
+    parser.add_argument("--project", default="debug", type=str)
+    parser.add_argument("--entity", default="YOUR_ENTITY", type=str)
+    parser.add_argument("--exp_name", default=None, type=str)
+    parser.add_argument("--overwrite_wandb", action="store_true")
+
+
+    parser.add_argument("--num_target_chunks", default=1, type=int)
+    parser.add_argument("--num_window_chunks", default=3, type=int)
+    parser.add_argument("--static", action="store_true")
+    parser.add_argument("--recurrent", action="store_true")
+    parser.add_argument("--num_mem_tokens", default=0, type=int)
+    parser.add_argument("--reverse", action="store_true")
+    parser.add_argument("--ar", action="store_true")
+    parser.add_argument("--num_bbox", default=32, type=int)
+
+    return parser
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def backup_python_files(backup_dir):
+    """Backup all Python files to the backup directory."""
+    if not os.path.exists(backup_dir):
+        os.makedirs(backup_dir, exist_ok=True)
+
+    # Get the root directory (current working directory)
+    root_dir = os.getcwd()
+
+    # Find all Python files recursively
+    for root, dirs, files in os.walk(root_dir):
+        # Skip backup directory itself, hidden directories, data directory, and output
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d != os.path.basename(backup_dir) and d != 'data' and d != 'output']
+
+        for file in files:
+            if file.endswith('.py'):
+                src_path = os.path.join(root, file)
+                # Create relative path for destination
+                rel_path = os.path.relpath(src_path, root_dir)
+                dst_path = os.path.join(backup_dir, rel_path)
+
+                # Create destination directory if needed
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+
+                # Copy the file
+                shutil.copy2(src_path, dst_path)
+
+    return backup_dir
+
+
+# ============================================================================
+# MAIN TRAINING FUNCTION
+# ============================================================================
+
+def main(args):
+    # ========================================================================
+    # Setup: Distributed training, logging, directories
+    # ========================================================================
+
+    distributed.enable(overwrite=True)
+
+    global logger
+    args.exp_name = args.model.replace("/", "-") if args.exp_name is None else args.exp_name
+    log_dir = os.path.join(args.output_dir, args.project, args.exp_name)
+    checkpoint_dir = os.path.join(log_dir, "checkpoints")
+    video_dir = os.path.join(log_dir, "videos")
+    backup_dir = os.path.join(log_dir, "backup")
+    tensorboard_dir = os.path.join("tensorboard", args.exp_name)  # Add tensorboard directory
+    args.log_dir, args.ckpt_dir, args.video_dir = log_dir, checkpoint_dir, video_dir
+
+    device = torch.device(args.device)
+    world_size, global_rank = distributed.get_world_size(), distributed.get_global_rank()
+    seed = args.seed + global_rank
+    misc.fix_random_seeds(seed)
+
+    log_writer = None
+    if global_rank == 0 and args.enable_tensorboard:
+        [os.makedirs(d, exist_ok=True) for d in [log_dir, checkpoint_dir, video_dir, backup_dir, tensorboard_dir]]
+
+        # Backup all Python files
+        backup_python_files(backup_dir)
+        
+        if args.enable_wandb:
+            # WandB logging
+            run_id_path, run_id = os.path.join(log_dir, "wandb_run_id.txt"), None
+            if os.path.exists(run_id_path) and not args.overwrite_wandb:
+                with open(run_id_path, "r") as f:
+                    run_id = f.readlines()[-1].strip()
+            log_writer = WandbLogger(args=args, resume="must", id=run_id)
+            if run_id is None:
+                with open(run_id_path, "a") as f:
+                    f.write(log_writer.run_id + "\n")
+        elif args.enable_tensorboard:
+            # TensorBoard logging (enabled by default if wandb is not enabled)
+            log_writer = TensorBoardLogger(
+                log_dir=tensorboard_dir, 
+                comment=f"{args.project}_{args.exp_name}"
+            )
+            # Log hyperparameters
+            if hasattr(log_writer, 'writer'):
+                log_writer.writer.add_text('hyperparameters', 
+                                            json.dumps(args.__dict__, indent=2), 0)
+
+    # set up logging
+    setup_logging(output=log_dir, level=logging.INFO)
+    logger = logging.getLogger("UFO")
+    logger.info(f"hostname: {os.uname().nodename}\n")
+    logger.info(f"job dir: {os.path.dirname(os.path.realpath(__file__))}")
+    logger.info(f"Logging to {log_dir}")
+    if global_rank == 0 and log_writer is not None:
+        if isinstance(log_writer, TensorBoardLogger):
+            logger.info(f"TensorBoard logging enabled. Run 'tensorboard --logdir {tensorboard_dir}' to view logs")
+        elif hasattr(log_writer, 'run_id'):
+            logger.info(f"WandB logging enabled with run_id: {log_writer.run_id}")
+    logger.info(json.dumps(args.__dict__, indent=4, sort_keys=True))
+    if global_rank == 0:
+        # Save final merged configuration
+        from ufo.utils.config import save_config, args_to_dict
+        final_config = args_to_dict(args)
+        save_config(final_config, os.path.join(log_dir, "config.json"))
+        logger.info(f"Saved final configuration to {os.path.join(log_dir, 'config.json')}")
+
+    # ========================================================================
+    # Dataset initialization
+    # ========================================================================
+
+    dataset_meta = DATASET_DICT[args.dataset]
+    train_annotation = dataset_meta["annotation_txt_file_train"]
+    val_annotation = dataset_meta["annotation_txt_file_val"]
+    if train_annotation is not None:
+        if args.dataset == "nuscenes":
+            train_annotation = f"data/dataset_scene_list/nuscenes_train.txt"
+        else:
+            train_annotation = f"{args.data_root}/{train_annotation}"
+    if val_annotation is not None:
+        if args.dataset == "nuscenes":
+            val_annotation = f"data/dataset_scene_list/nuscenes_val.txt"
+        else:
+            val_annotation = f"{args.data_root}/{val_annotation}"
+        if not os.path.exists(val_annotation):
+            val_annotation = None
+
+    dataset_train = UFODataset(
+        data_root=args.data_root,
+        annotation_txt_file_list=train_annotation,
+        target_size=args.input_size,
+        num_context_timesteps=args.num_context_timesteps,
+        num_target_timesteps=args.num_target_timesteps,
+        timespan=args.timespan,
+        num_max_cams=args.num_max_cameras,
+        load_depth=args.load_depth,
+        load_flow=args.load_flow,
+        skip_sky_mask=args.skip_sky_mask,
+        num_target_chunks=args.num_target_chunks,
+        static=args.static,
+        reverse=args.reverse,
+        args=args
+    )
+    sampler_train = InfiniteSampler(sample_count=len(dataset_train), shuffle=True, seed=seed)
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train,
+        sampler=sampler_train,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=False,
+        persistent_workers=True if args.num_workers > 0 else False,
+        drop_last=True,
+    )
+
+    if val_annotation is not None:
+        dataset_val = UFODataset(
+            data_root=args.data_root,
+            annotation_txt_file_list=val_annotation,
+            target_size=args.input_size,
+            num_context_timesteps=args.num_context_timesteps,
+            num_target_timesteps=args.num_target_timesteps,
+            timespan=args.timespan,
+            num_max_cams=args.num_max_cameras,
+            load_depth=args.load_depth,
+            load_flow=args.load_flow,
+            skip_sky_mask=args.skip_sky_mask,
+            num_target_chunks=args.num_target_chunks,
+            static=args.static,
+            reverse=args.reverse,
+            args=args
+        )
+        dataset_eval = UFODatasetEval(
+            data_root=args.data_root,
+            annotation_txt_file_list=val_annotation,
+            target_size=args.input_size,
+            num_context_timesteps=args.num_context_timesteps,
+            num_target_timesteps=args.num_target_timesteps,
+            timespan=args.timespan,
+            num_max_cams=args.num_max_cameras,
+            load_depth=args.load_depth,
+            load_flow=args.load_flow,
+            load_dynamic_mask=True,
+            load_ground_label=args.load_ground,
+            skip_sky_mask=args.skip_sky_mask,
+            num_target_chunks=args.num_target_chunks,
+            static=args.static,
+            reverse=args.reverse,
+            args=args
+        )
+        dataset_eval_flow = UFODatasetEval(
+            data_root=args.data_root,
+            annotation_txt_file_list=val_annotation,
+            target_size=args.input_size,
+            num_context_timesteps=args.num_context_timesteps,
+            num_target_timesteps=args.num_target_timesteps,
+            timespan=args.timespan,
+            num_max_cams=args.num_max_cameras,
+            load_depth=args.load_depth,
+            load_flow=args.load_flow,
+            load_dynamic_mask=False,
+            load_ground_label=args.load_ground,
+            return_context_as_target=True,
+            skip_sky_mask=args.skip_sky_mask,
+            num_target_chunks=args.num_target_chunks,
+            static=args.static,
+            reverse=args.reverse,
+            args=args
+        )
+        sampler = NoPaddingDistributedSampler(
+            dataset_eval,
+            num_replicas=world_size,
+            rank=global_rank,
+            shuffle=False,
+        )
+        data_loader_eval = torch.utils.data.DataLoader(
+            dataset_eval,
+            batch_size=args.eval_batch_size,
+            num_workers=args.num_workers,
+            sampler=sampler,
+            pin_memory=False,
+            persistent_workers=True if args.num_workers > 0 else False,
+            shuffle=False,
+            drop_last=False,
+        )
+        data_loader_eval_flow = torch.utils.data.DataLoader(
+            dataset_eval_flow,
+            batch_size=args.eval_batch_size,
+            num_workers=args.num_workers,
+            sampler=sampler,
+            pin_memory=False,
+            persistent_workers=True if args.num_workers > 0 else False,
+            shuffle=False,
+            drop_last=False,
+        )
+    else:
+        dataset_val = None
+        dataset_eval = None
+        dataset_eval_flow = None
+        data_loader_eval = None
+        data_loader_eval_flow = None
+
+    logger.info(f"Dataset: {args.dataset}, train: {train_annotation}, val: {val_annotation}")
+    logger.info(f"Dataset contains {len(dataset_train):,} sequences using {train_annotation}.")
+
+    # ========================================================================
+    # Model initialization
+    # ========================================================================
+
+    if args.arch not in models.ARCHITECTURES:
+        raise ValueError(
+            f"Invalid arch: {args.arch!r}. "
+            f"Available architectures: {sorted(models.ARCHITECTURES.keys())}"
+        )
+    arch_models = models.ARCHITECTURES[args.arch]
+    if args.model not in arch_models:
+        raise ValueError(
+            f"Invalid model name {args.model!r} for arch={args.arch!r}. "
+            f"Available models for this arch: {sorted(arch_models.keys())}"
+        )
+    model = arch_models[args.model](
+        img_size=args.input_size,
+        gs_dim=args.gs_dim,
+        decoder_type=args.decoder_type,
+        grad_checkpointing=not args.disable_grad_checkpointing,
+        use_sky_token=args.use_sky_token,
+        use_affine_token=args.use_affine_token,
+        num_motion_tokens=args.num_motion_tokens,
+        use_latest_gsplat=args.use_latest_gsplat,
+        static=args.static,
+        num_mem_tokens=args.num_mem_tokens,
+        args=args
+    )
+
+    logger.info(f"Model = {str(model)}")
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"{args.model} Parameters: {n_params / 1e6:.2f}M ({n_params:,})")
+    model.to(device)
+    model_without_ddp = model
+
+    if distributed.is_enabled():
+        model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+        model_without_ddp = model.module
+    global_batch_size = args.batch_size * world_size
+    if args.lr is None:  # only base_lr is specified
+        args.lr = args.blr * global_batch_size / 256
+    logger.info("Global batch size: %d" % global_batch_size)
+    logger.info(f"Base lr: {args.lr * 256 / global_batch_size:.2e}, Actual lr: {args.lr:.2e}")
+
+    # ========================================================================
+    # Optimizer and loss scaler
+    # ========================================================================
+
+    param_groups = optim_factory.param_groups_weight_decay(model_without_ddp, args.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    loss_scaler = NativeScaler()
+
+    logger.info(f"Optimizer = {optimizer}")
+    logger.info(f"Loss Scaler = {loss_scaler}")
+
+    # Load checkpoint or resume training
+    logger.info(f"Original start Iteration: {args.start_iteration}")
+    vis_slice_id = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
+    logger.info(f"New start iteration {args.start_iteration}")
+
+    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"{args.model} Trainable Parameters: {num_trainable_params / 1e6:.2f}M")
+    logger.info(f"Training with {world_size} GPUs")
+
+    data_iter_step = args.start_iteration
+    if log_writer is not None:
+        log_writer.set_step(data_iter_step)
+
+    # ========================================================================
+    # Evaluation and visualization
+    # ========================================================================
+
+    if args.evaluate:
+        eval_result = evaluate(data_loader_eval, model_without_ddp, args)
+        if log_writer is not None and eval_result is not None:
+            eval_result = {f"eval/{k}": v for k, v in eval_result.items()}
+            log_writer.update(eval_result)
+        if args.dataset == "waymo":
+            if args.decoder_type != "conv":
+                flow_eval_result = evaluate_flow(data_loader_eval_flow, model_without_ddp, args)
+                if log_writer is not None and flow_eval_result is not None:
+                    flow_eval_result = {f"eval/{k}": v for k, v in flow_eval_result.items()}
+                    log_writer.update(flow_eval_result)
+        logger.info("Evaluation done, exiting.")
+        exit()
+
+    valid_slice_id = copy.deepcopy(vis_slice_id)
+    if dataset_val is not None and valid_slice_id >= len(dataset_val):
+        valid_slice_id = 0
+
+    val(args, model_without_ddp, dataset_val, log_writer=log_writer, output_prefix=os.path.join(args.log_dir, "videos", f"{data_iter_step:07d}"))
+
+    if args.visualization_only:
+        logger.info("Visualization done, exiting.")
+        exit()
+
+    rgb_and_lpips_loss = RGBLpipsLoss(
+        perceptual_weight=args.perceptual_weight,
+        enable_perceptual_loss=args.enable_perceptual_loss,
+    ).to(device)
+    rgb_and_lpips_loss.set_perceptual_loss(False)
+
+    # ========================================================================
+    # Training loop
+    # ========================================================================
+
+    logger.info(f"Starting training from iteration {args.start_iteration} to {args.num_iterations}")
+    metrics_file = os.path.join(args.log_dir, "training_metrics.json")
+    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
+    start_time = time.time()
+    num_tokens_printed = False
+
+    for data_dict in metric_logger.log_every(
+        data_loader_train,
+        print_freq=args.log_every_n_iters,
+        header="Training",
+        n_iterations=args.num_iterations,
+        start_iteration=args.start_iteration,
+    ):
+        if data_iter_step > args.num_iterations:
+            break
+        if log_writer is not None:
+            log_writer.set_step(data_iter_step)
+        if args.enable_perceptual_loss and data_iter_step >= args.perceptual_loss_start_iter:
+            rgb_and_lpips_loss.set_perceptual_loss(True)
+
+        model.train()
+        misc.adjust_learning_rate(optimizer, data_iter_step, args)
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            # Forward pass and loss computation
+            loss_total = 0
+            inout_dicts = prepare_inputs_and_targets(data_dict, device, timespan=args.timespan, from_list=True, args=args)
+
+
+            all_gs_features = {}
+
+            if args.reverse:
+                range_inout = range(len(inout_dicts) - 1, -1, -1)
+            else:
+                range_inout = range(len(inout_dicts))
+            # Autoregressive processing loop
+            for i in range_inout:
+                input_dict, target_dict = inout_dicts[i]
+
+                # Set previous state variables for recurrent processing
+                pred_dict, all_gs_features = update_scene(input_dict, model, scene=all_gs_features, export_ply=False, profile=False, filter_num=args.filter_num, log_dir=args.log_dir)
+                loss_dict = compute_loss(pred_dict, target_dict, args, rgb_and_lpips_loss)
+                loss_dict.update({'class_loss': pred_dict['class_loss']})
+
+                if 'ray_loss' in pred_dict:
+                    loss_dict.update({'ray_loss': pred_dict['ray_loss']})
+
+                loss_value = sum(loss for k, loss in loss_dict.items() if "loss" in k)
+                loss_total += loss_value
+
+        if not math.isfinite(loss_total):
+            logger.info("NaN detected")
+            raise AssertionError
+
+        grad_norm = loss_scaler(
+            loss_total,
+            optimizer,
+            parameters=model.parameters(),
+            clip_grad=args.grad_clip,
+        )
+        optimizer.zero_grad()
+        torch.cuda.synchronize()
+        if world_size > 1:
+            [torch.distributed.all_reduce(v) for v in loss_dict.values()]
+        loss_dict_reduced = {k: v.item() / world_size for k, v in loss_dict.items()}
+        total_loss_reduced = sum(loss for k, loss in loss_dict_reduced.items() if "loss" in k)
+        lr = optimizer.param_groups[0]["lr"]
+        psnr = -10 * np.log10(loss_dict_reduced["rgb_loss"])
+        metric_logger.update(lr=lr, psnr=psnr, loss=total_loss_reduced, **loss_dict_reduced)
+        metric_logger.update(grad_norm=grad_norm)
+
+        if "num_tokens" in pred_dict and not num_tokens_printed:
+            logger.info(f"num_tokens: {pred_dict['num_tokens']}")
+            num_tokens_printed = True
+
+        if log_writer is not None:
+            log_writer.update(
+                {
+                    "train/psnr": psnr,
+                    "train/loss": total_loss_reduced,
+                    **{f"train/{k}": v for k, v in loss_dict_reduced.items()},
+                    "train/lr": lr,
+                    "train/grad_norm": grad_norm,
+                }
+            )
+            # Flush TensorBoard periodically
+            if isinstance(log_writer, TensorBoardLogger) and data_iter_step % 100 == 0:
+                log_writer.flush()
+
+        if (data_iter_step + 1) % args.ckpt_every_n_iters == 0:
+            if distributed.is_main_process():
+                elapsed_t = time.time() - start_time + args.total_elapsed_time
+                checkpoint = {
+                    "model": model_without_ddp.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "loss_scaler": loss_scaler.state_dict(),
+                    "latest_step": data_iter_step,
+                    "vis_slice_id": vis_slice_id,
+                    "args": args,
+                    "total_elapsed_time": elapsed_t,
+                }
+                checkpoint_path = os.path.join(args.ckpt_dir, f"ckpt_{data_iter_step:06d}.pth")
+                torch.save(checkpoint, checkpoint_path)
+                misc.cleanup_checkpoints(args.ckpt_dir, keep_num=args.keep_n_ckpts)
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+            torch.distributed.barrier()
+            torch.cuda.empty_cache()
+
+        if (data_iter_step + 1) % args.vis_every_n_iters == 0:
+            val(args, model_without_ddp, dataset_val, log_writer=log_writer, output_prefix=os.path.join(args.log_dir, "videos", f"{data_iter_step:07d}"))
+
+        data_iter_step += 1
+
+    metric_logger.synchronize_between_processes()
+
+    # ========================================================================
+    # Final evaluation
+    # ========================================================================
+
+    total_time = time.time() - start_time + args.total_elapsed_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    logger.info("Training time {}".format(total_time_str))
+    eval_result = evaluate(data_loader_eval, model_without_ddp, args)
+    if log_writer is not None and eval_result is not None:
+        log_writer.update({f"eval/{k}": v for k, v in eval_result.items()})
+    if args.decoder_type != "conv" and args.dataset == "waymo":
+        flow_eval_result = evaluate_flow(data_loader_eval_flow, model_without_ddp, args)
+        if log_writer is not None and flow_eval_result is not None:
+            log_writer.update({f"eval/{k}": v for k, v in flow_eval_result.items()})
+    logger.info("Done!")
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    import os
+    from pathlib import Path
+    from ufo.utils.config import merge_config_and_args
+
+    parser = get_args_parser()
+
+    # Default config file path
+    default_config = Path("config.json")
+
+    # First parse to check if --config was specified
+    temp_args = parser.parse_args()
+
+    # Use specified config, or default if it exists
+    config_path = temp_args.config if temp_args.config else (str(default_config) if default_config.exists() else None)
+
+    # Merge config and args (CLI args take precedence)
+    args = merge_config_and_args(parser, config_path=config_path)
+
+    main(args)
+

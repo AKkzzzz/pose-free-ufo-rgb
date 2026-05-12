@@ -1,0 +1,9 @@
+/data
+__pycache__
+/tensorboard/
+/*.pth
+/output
+/ckpts
+/2026*/
+*.pcd
+*.ply
