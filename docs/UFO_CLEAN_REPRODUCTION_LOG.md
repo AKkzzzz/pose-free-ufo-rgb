@@ -15,7 +15,9 @@
 - Uniform training sampler. D50 is not part of this baseline.
 - Resource-adapted effective batch 8: one GPU x batch 1 x accumulation 8.
 - Each optimizer step consumes 8 sequences and 32 recurrent chunks.
-- Per-chunk render/loss sum, one backward, detached recurrent scene state.
+- Per-chunk render/loss sum and one backward. Old scene input is detached by
+  `allow_old_scene_grad=false`; blanket post-chunk detach remains off because it
+  duplicates that boundary and breaks reentrant checkpoint/DDP parameter hooks.
 - Official RGB re-encoding for visible old scene input.
 - AdamW, 5000 optimizer-step linear warmup to 1e-4, then constant 1e-4.
 - LPIPS weight 0.05 activates at optimizer step 5000.

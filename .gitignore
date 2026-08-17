@@ -3,6 +3,7 @@ __pycache__
 /tensorboard/
 /*.pth
 /output
+/outputs/
 /ckpts
 /2026*/
 *.pcd

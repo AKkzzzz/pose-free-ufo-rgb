@@ -24,7 +24,7 @@
   "recurrent": true,
   "ar": true,
   "scene_token_input": "official_rgb",
-  "detach_scene_between_chunks": true,
+  "detach_scene_between_chunks": false,
   "sequential_chunk_backward": false,
   "allow_old_scene_grad": false,
   "gaussian_decoder_layers": "mlp2",
