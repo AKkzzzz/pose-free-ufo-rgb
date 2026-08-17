@@ -33,6 +33,10 @@
 | 7,500 | pending | pending | pending | pending | trend |
 | 10,000 | pending | pending | pending | pending | first capability gate |
 
+Launch state: queued behind the independent post-warmup diagnostic on the only
+available GPU. The queue runs one exact-EB8 random-initialization optimizer-step
+smoke, then starts the 10k command only if the smoke exits successfully.
+
 Gate: if 5k to 10k PSNR is still rising materially, continue to 25k without
 structural changes. Only a clear plateau far below the paper result reopens the
 technical-review findings.
