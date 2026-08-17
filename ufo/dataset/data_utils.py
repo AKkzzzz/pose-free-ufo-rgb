@@ -235,6 +235,9 @@ def resize_flow(flow, target_size):
 
 def prepare_inputs_and_targets(data_dict, device=torch.device("cuda"), v=3, timespan=2.0, from_list=False, args=None):
 
+    if args is not None:
+        v = args.num_max_cameras
+
     if from_list is True:
         N = len(data_dict)
         if type(data_dict[0]['global_frame']) is bool:
@@ -328,6 +331,10 @@ def prepare_inputs_and_targets(data_dict, device=torch.device("cuda"), v=3, time
         input_dict['context_instances_id'] = data_dict['context']['instances_id'].reshape(
             b, context_t, args.num_bbox
         )
+        if 'instances_track_id' in data_dict['context']:
+            input_dict['context_instances_track_id'] = data_dict['context']['instances_track_id'].reshape(
+                b, context_t, args.num_bbox
+            )
 
     if "instances_pose" in data_dict["target"]:
         input_dict['target_instances_pose'] = data_dict["target"]['instances_pose'].reshape(
@@ -343,6 +350,10 @@ def prepare_inputs_and_targets(data_dict, device=torch.device("cuda"), v=3, time
         input_dict['target_instances_id'] = data_dict['target']['instances_id'].reshape(
             b, target_t, args.num_bbox
         )
+        if 'instances_track_id' in data_dict['target']:
+            input_dict['target_instances_track_id'] = data_dict['target']['instances_track_id'].reshape(
+                b, target_t, args.num_bbox
+            )
         
     input_dict["context_frame_idx"] = data_dict["context"]["frame_idx"]
     target_dict["target_frame_idx"] = data_dict["target"]["frame_idx"]

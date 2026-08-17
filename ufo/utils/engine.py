@@ -33,9 +33,6 @@ from ufo.utils.misc import compute_point_visibility, compute_visible_topk_indice
 from ufo.utils.misc import combine_dict_entries, project_boxes_to_image, convert_to_chunks
 from ufo.utils.misc import update_scene
 # Import depth evaluation functions
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
 from reference_depth_eval import depth_evaluation
 
 logger = logging.getLogger("UFO")

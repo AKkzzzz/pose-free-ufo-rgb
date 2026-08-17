@@ -37,6 +37,7 @@ import open3d as o3d
 import numpy as np
 import time
 from einops import rearrange
+from ufo.paper_contract import relative_se3, transform_directions, transform_points
 
 def save_point_cloud(points: torch.Tensor, save_path: str) -> None:
     """
@@ -253,18 +254,15 @@ def load_model(args, model_without_ddp, optimizer=None, loss_scaler=None):
             msg = model_without_ddp.load_state_dict(checkpoint["model"], strict=False)
             logger.info(f"[Model-resume] Loaded model: {msg}")
             checkpoint_loaded = True
-            # try:
-            #     if "optimizer" in checkpoint and "latest_step" in checkpoint and optimizer is not None:
-            #         msg = optimizer.load_state_dict(checkpoint["optimizer"])
-            #         logger.info(f"[Model-resume] Loaded optimizer: {msg}")
-            #         args.start_iteration = checkpoint["latest_step"] + 1
-            #         if "loss_scaler" in checkpoint and loss_scaler is not None:
-            #             msg = loss_scaler.load_state_dict(checkpoint["loss_scaler"])
-            #             logger.info(f"[Model-resume] Loaded loss_scaler: {msg}")
-            #         if "vis_slice_id" in checkpoint:
-            #             vis_slice_id = checkpoint["vis_slice_id"] + 1
-            # except:
-            #     print("Error loading optimizer, may be due to parameter mismatch")
+            if "optimizer" in checkpoint and "latest_step" in checkpoint and optimizer is not None:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+                logger.info("[Model-resume] Loaded optimizer state")
+                args.start_iteration = checkpoint["latest_step"] + 1
+                if "loss_scaler" in checkpoint and loss_scaler is not None:
+                    loss_scaler.load_state_dict(checkpoint["loss_scaler"])
+                    logger.info("[Model-resume] Loaded loss scaler state")
+                if "vis_slice_id" in checkpoint:
+                    vis_slice_id = checkpoint["vis_slice_id"] + 1
             if "latest_step" in checkpoint:
                 args.prev_num_iterations = checkpoint["latest_step"]
                 args.start_iteration = checkpoint["latest_step"] + 1
@@ -402,16 +400,23 @@ class NativeScalerWithGradNormCount:
         create_graph=False,
         update_grad=True,
     ):
-        self._scaler.scale(loss).backward(create_graph=create_graph)
+        self.backward(loss, create_graph=create_graph)
         norm = None
         if update_grad:
-            self._scaler.unscale_(optimizer)
-            if clip_grad is not None and clip_grad > 0.0:
-                norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
-            else:
-                norm = get_grad_norm_(parameters)
-            self._scaler.step(optimizer)
-            self._scaler.update()
+            norm = self.step(optimizer, parameters=parameters, clip_grad=clip_grad)
+        return norm
+
+    def backward(self, loss, create_graph=False):
+        self._scaler.scale(loss).backward(create_graph=create_graph)
+
+    def step(self, optimizer, parameters, clip_grad=None):
+        self._scaler.unscale_(optimizer)
+        if clip_grad is not None and clip_grad > 0.0:
+            norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
+        else:
+            norm = get_grad_norm_(parameters)
+        self._scaler.step(optimizer)
+        self._scaler.update()
         return norm
 
     def state_dict(self):
@@ -421,7 +426,19 @@ class NativeScalerWithGradNormCount:
     def load_state_dict(self, state_dict):
         """Load state dictionary for the scaler."""
         self._scaler.load_state_dict(state_dict)
-        
+
+
+def detach_tensors(value):
+    """Detach tensor leaves in a recurrent scene container."""
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: detach_tensors(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [detach_tensors(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(detach_tensors(item) for item in value)
+    return value
 
 
 def forward_ar(args, inout_dicts):
@@ -706,8 +723,8 @@ def compute_visible_topk_indices_any_view(
 ) -> torch.Tensor:                # [B, k] long, -1 where not enough visible
     """
     For each batch, among points visible in *any* camera, return indices of the top-k
-    closest points, where “closeness” is defined by the minimum camera-space depth Zc
-    across all cameras in which the point is visible (no occlusion reasoning).
+    closest points by Euclidean distance to a camera center, as specified by
+    UFO Eq. (2). Frustum visibility is still evaluated independently per view.
 
     Returns:
         Long tensor [B, k]; entries are point indices in [0, N-1], or -1 when
@@ -741,10 +758,14 @@ def compute_visible_topk_indices_any_view(
     in_y = (v >= 0) & (v < H)
     visible = in_front & in_x & in_y                                       # [B, M, N]
 
-    # For each point, take the minimum Zc over cameras where it is visible.
-    # Invisible entries are set to +inf so they don't affect the min.
-    zc_masked = torch.where(visible, zc, torch.full_like(zc, float('inf'))) # [B, M, N]
-    min_depth, best_cam = zc_masked.min(dim=1)                              # [B, N], [B, N]
+    camera_centers = cam_extrinsics[..., :3, 3]
+    distances = torch.linalg.vector_norm(
+        points_3d[:, None] - camera_centers[:, :, None], dim=-1
+    )
+    distance_masked = torch.where(
+        visible, distances, torch.full_like(distances, float('inf'))
+    )
+    min_depth, best_cam = distance_masked.min(dim=1)
 
     # ---- Token selection strategy ----
     # Two modes:
@@ -1105,7 +1126,10 @@ def batched_index_update(
 
 
 
-def update_scene(input_dict, model, scene={}, export_ply=False, profile=False, render=True, filter_num=3600, log_dir=''):
+def update_scene(
+    input_dict, model, scene=None, export_ply=False, profile=False, render=True,
+    filter_num=3600, log_dir='', detach_old_scene=True,
+):
     """ Update the scene representation with new input frames
 
     Args:
@@ -1113,15 +1137,25 @@ def update_scene(input_dict, model, scene={}, export_ply=False, profile=False, r
         log_dir: Directory where PLY files will be exported when export_ply=True
     """
 
+    scene = {} if scene is None else scene
     profile=False
     export_ply=False
     
-    # 0. transformation from current frame to global frame
-    toglobal_translation = input_dict['context_camtoworlds_global'][..., :3, 3] - input_dict['context_camtoworlds'][..., :3, 3]
-    toglobal_translation = toglobal_translation.reshape(-1, 3).mean(dim=0)
+    # Mapping between the current camera-centric frame and persistent scene world.
+    # The relation is camera-independent; use the first synchronized camera.
+    with torch.autocast(device_type=input_dict['context_image'].device.type, enabled=False):
+        scene_from_local = relative_se3(
+            input_dict['context_camtoworlds_global'][:, 0, 0].float(),
+            input_dict['context_camtoworlds'][:, 0, 0].float(),
+        )
+        local_from_scene = torch.linalg.inv(scene_from_local)
 
     # metadata
     current_chunk_id = scene["_chunk_id"] + 1 if scene and "_chunk_id" in scene else 0
+    previous_token_count = int(scene["gs_state"].shape[1]) if scene and "gs_state" in scene else 0
+    visible_token_count = 0
+    old_update_l2_mean = 0.0
+    old_update_l2_max = 0.0
 
 
 
@@ -1135,12 +1169,12 @@ def update_scene(input_dict, model, scene={}, export_ply=False, profile=False, r
 
 
 
-    ### hack offset
-    offset = abs(int(input_dict['context_time'].flatten()[0])) - 1
-    # # input_dict['gs_time'] = input_dict['context_time'].clone()
-    input_dict['context_time'] += offset
-    # input_dict['context_time'] = input_dict['context_time'] / 8
-    print("input context time", input_dict['context_time'])
+    model_args = getattr(model.module if hasattr(model, "module") else model, "args")
+    if not model_args.disable_legacy_time_offset:
+        # Official v1 forces every chunk's first context time to -1. This is
+        # retained only for baseline compatibility; it destroys global dt.
+        offset = abs(int(input_dict['context_time'].flatten()[0])) - 1
+        input_dict['context_time'] += offset
 
     # 1. Filter scene scene tokens if scene is not empty
 
@@ -1177,18 +1211,30 @@ def update_scene(input_dict, model, scene={}, export_ply=False, profile=False, r
                                             )
             
             # gather visible scene tokens
-            posterior_gs = batched_index_gather(scene['gs_state'].detach(), context_visibility_map)
+            old_state = scene['gs_state'].detach() if detach_old_scene else scene['gs_state']
+            posterior_gs = batched_index_gather(old_state, context_visibility_map)
 
-            posterior_gs_origins = scene['gs_origins'] - toglobal_translation
-            posterior_gs_origins = convert_to_chunks(posterior_gs_origins).reshape(1, -1, 8, 8, 3)
+            posterior_gs_xyz = transform_points(
+                local_from_scene[:, None], scene['gs_token_means']
+            )
+            posterior_gs_xyz = batched_index_gather(
+                posterior_gs_xyz, context_visibility_map
+            )
+
+            posterior_gs_origins = transform_points(
+                local_from_scene[:, None, None, None, None], scene['gs_origins']
+            )
+            posterior_gs_origins = convert_to_chunks(posterior_gs_origins).reshape(b_context, -1, 8, 8, 3)
             posterior_gs_origins = batched_index_gather(posterior_gs_origins, context_visibility_map)
 
-            posterior_gs_dirs = scene['gs_dirs']
-            posterior_gs_dirs = convert_to_chunks(posterior_gs_dirs).reshape(1, -1, 8, 8, 3)
+            posterior_gs_dirs = transform_directions(
+                local_from_scene[:, None, None, None, None], scene['gs_dirs']
+            )
+            posterior_gs_dirs = convert_to_chunks(posterior_gs_dirs).reshape(b_context, -1, 8, 8, 3)
             posterior_gs_dirs = batched_index_gather(posterior_gs_dirs, context_visibility_map)
 
             posterior_image = scene['image']
-            posterior_image = convert_to_chunks(scene['image'].permute(0, 1, 2, 4, 5, 3)).reshape(1, -1, 8, 8, 3)
+            posterior_image = convert_to_chunks(scene['image'].permute(0, 1, 2, 4, 5, 3)).reshape(b_context, -1, 8, 8, 3)
             posterior_image = batched_index_gather(posterior_image, context_visibility_map)
 
 
@@ -1198,34 +1244,54 @@ def update_scene(input_dict, model, scene={}, export_ply=False, profile=False, r
 
             # Strip invalid tokens (where visibility map is -1) to prevent
             # zeroed inputs from producing non-zero features via bias/time_embed
-            valid_mask = (context_visibility_map != -1).squeeze(0)  # [k]
+            per_batch_valid = context_visibility_map != -1
+            if not torch.equal(per_batch_valid, per_batch_valid[:1].expand_as(per_batch_valid)):
+                raise ValueError("batched scenes must expose the same visible-token count")
+            valid_mask = per_batch_valid[0]
             if not valid_mask.all():
                 posterior_gs = posterior_gs[:, valid_mask]
                 posterior_gs_origins = posterior_gs_origins[:, valid_mask]
                 posterior_gs_dirs = posterior_gs_dirs[:, valid_mask]
                 posterior_image = posterior_image[:, valid_mask]
                 posterior_gs_time = posterior_gs_time[:, valid_mask]
+                posterior_gs_xyz = posterior_gs_xyz[:, valid_mask]
                 # Update visibility map for write-back in step 4
                 context_visibility_map = context_visibility_map[:, valid_mask]
+
+            visible_token_count = int(context_visibility_map.shape[1])
 
             input_dict['posterior_gs_dirs'] = posterior_gs_dirs
             input_dict['posterior_gs_origins'] = posterior_gs_origins
             input_dict['posterior_gs_time'] = posterior_gs_time
             input_dict['posterior_gs'] = posterior_gs
+            input_dict['posterior_gs_xyz'] = posterior_gs_xyz
             input_dict['posterior_image'] = posterior_image
-            print("posterior_gs_shape", posterior_gs.shape)
         else:
 
-            input_dict['posterior_gs_origins'] = convert_to_chunks(scene['gs_origins'] - toglobal_translation).reshape(1, -1, 8, 8, 3)
-            input_dict['posterior_gs_dirs'] = convert_to_chunks(scene['gs_dirs']).reshape(1, -1, 8, 8, 3)
+            local_origins = transform_points(
+                local_from_scene[:, None, None, None, None], scene['gs_origins']
+            )
+            local_dirs = transform_directions(
+                local_from_scene[:, None, None, None, None], scene['gs_dirs']
+            )
+            input_dict['posterior_gs_origins'] = convert_to_chunks(local_origins).reshape(b_context, -1, 8, 8, 3)
+            input_dict['posterior_gs_dirs'] = convert_to_chunks(local_dirs).reshape(b_context, -1, 8, 8, 3)
             input_dict['posterior_gs_time'] = scene['gs_time'].unsqueeze(-1).repeat(1, 1, 1, 600).reshape(b_context, -1)
-            input_dict['posterior_gs'] = scene['gs_state'].detach() # detach previous state
+            input_dict['posterior_gs'] = (
+                scene['gs_state'].detach() if detach_old_scene else scene['gs_state']
+            )
+            input_dict['posterior_gs_xyz'] = transform_points(
+                local_from_scene[:, None], scene['gs_token_means']
+            )
 
-            input_dict['posterior_image'] = convert_to_chunks(scene['image'].permute(0, 1, 2, 4, 5, 3)).reshape(1, -1, 8, 8, 3)
+            input_dict['posterior_image'] = convert_to_chunks(scene['image'].permute(0, 1, 2, 4, 5, 3)).reshape(b_context, -1, 8, 8, 3)
             input_dict['posterior_c2w'] = scene['c2w'].clone()
             input_dict['posterior_time'] = scene['time']
-            input_dict['posterior_c2w'][..., :3, 3] -= toglobal_translation
+            input_dict['posterior_c2w'] = local_from_scene[:, None, None] @ input_dict['posterior_c2w']
             input_dict['posterior_intr'] = scene['intr']
+
+        if model_args.recurrent_aux_tokens:
+            input_dict['posterior_aux_state'] = scene.get('aux_state')
     
     if profile:
         torch.cuda.synchronize()
@@ -1257,6 +1323,9 @@ def update_scene(input_dict, model, scene={}, export_ply=False, profile=False, r
         torch.cuda.synchronize()
         start_time = time.perf_counter()
     if scene and len(scene['gs_state']) > 0 and filter_num > 0:
+        old_update_delta = (input_dict['updated_posterior'].detach().float() - input_dict['posterior_gs'].detach().float()).norm(dim=-1)
+        old_update_l2_mean = old_update_delta.mean().item()
+        old_update_l2_max = old_update_delta.max().item()
         if filtering:
             scene['gs_state'] = batched_index_update(
                 scene['gs_state'],
@@ -1290,27 +1359,47 @@ def update_scene(input_dict, model, scene={}, export_ply=False, profile=False, r
 
         # token means is the average of all gs means
         token_means = rearrange(F.avg_pool2d(gs_means, kernel_size=8, stride=8), '(b t v) c h w -> b (t v h w) c', b=input_dict['gs_params']['means'].shape[0], t=input_dict['gs_params']['means'].shape[1])
-        token_means = token_means + toglobal_translation  # transform to global
+        token_means = transform_points(scene_from_local[:, None], token_means)
+
+        assignment_anchor_means = input_dict.get('assignment_anchor_means')
+        if assignment_anchor_means is not None:
+            assignment_anchor_means = transform_points(
+                scene_from_local[:, None], assignment_anchor_means
+            )
+
+        global_origins = transform_points(
+            scene_from_local[:, None, None, None, None], input_dict['gs_origins']
+        )
+        global_dirs = transform_directions(
+            scene_from_local[:, None, None, None, None], input_dict['gs_dirs']
+        )
 
     # create new scene dict
     new_scene = {
         
         # scene token metadata (constant)
-        "gs_origins": input_dict['gs_origins'] + toglobal_translation,  # transform to global
-        "gs_dirs": input_dict['gs_dirs'],   # we assume local and global dirs are the same
+        "gs_origins": global_origins,
+        "gs_dirs": global_dirs,
         "gs_time": input_dict['gs_time'],
         
         # variable scene token state and position
         "gs_state": input_dict['gs_state'],
         "gs_token_means": token_means,  # location of each scene token in global frame
+        "assignment_anchor_means": assignment_anchor_means,
+        "assignment_anchor_valid": input_dict.get('assignment_anchor_valid'),
+        "assignment_coverage_targets": input_dict.get('assignment_coverage_targets'),
+        "assignment_coverage_valid": input_dict.get('assignment_coverage_valid'),
         
         
         
         # keep record of bbox metadata (constant)
-        "bbox_weights": input_dict['bbox_weights'], # bbox weights for each gaussian
+        "bbox_weights": input_dict['bbox_weights'],
+        "bbox_token_weights": input_dict['bbox_token_weights'],
+        "bbox_token_logits": input_dict.get('bbox_token_logits'),
         "context_instances_corner": input_dict['context_instances_corner'],
         "context_instances_id": input_dict['context_instances_id'],
         "context_instances_pose": input_dict['context_instances_pose'],
+        "context_instances_track_id": input_dict.get('context_instances_track_id'),
 
 
         # 0317 debug
@@ -1326,8 +1415,24 @@ def update_scene(input_dict, model, scene={}, export_ply=False, profile=False, r
         temp_dict.update(new_scene)
         temp_dict = model(temp_dict, stage=2, motion=False)
         model.forward_3_export(temp_dict, f"{log_dir}_chunk_" + str(current_chunk_id) + "_3_new.ply")
+    new_scene = {key: value for key, value in new_scene.items() if value is not None}
     scene = combine_dict_entries([scene, new_scene], [k for k in new_scene.keys() if not k.startswith('_')])
+    if model_args.recurrent_aux_tokens:
+        scene['aux_state'] = input_dict['mis_state']
     scene["_chunk_id"] = current_chunk_id
+    xyz = scene["gs_token_means"].detach().float()
+    scene_diagnostics = {
+        "chunk": current_chunk_id,
+        "scene_token_count": int(scene["gs_state"].shape[1]),
+        "visible_token_count": visible_token_count,
+        "visible_ratio": visible_token_count / max(previous_token_count, 1),
+        "new_token_count": int(new_scene["gs_state"].shape[1]),
+        "token_xyz_min_xyz": xyz.amin(dim=(0, 1)).cpu().tolist(),
+        "token_xyz_max_xyz": xyz.amax(dim=(0, 1)).cpu().tolist(),
+        "token_xyz_mean_norm": xyz.norm(dim=-1).mean().item(),
+        "old_token_update_l2_mean": old_update_l2_mean,
+        "old_token_update_l2_max": old_update_l2_max,
+    }
     if profile:
         torch.cuda.synchronize()
         end_time = time.perf_counter()
@@ -1342,6 +1447,7 @@ def update_scene(input_dict, model, scene={}, export_ply=False, profile=False, r
         input_dict.update(scene)
         input_dict = model(input_dict, stage=2, motion=False)
         pred_dict = model(input_dict, stage=3)
+        pred_dict["scene_diagnostics"] = scene_diagnostics
         if profile:
             torch.cuda.synchronize()
             end_time = time.perf_counter()

@@ -17,6 +17,8 @@ import logging
 import os
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import bisect
+from collections import OrderedDict
+from pathlib import Path
 import numpy as np
 import torch
 import torchvision.transforms as transforms
@@ -27,6 +29,7 @@ from tqdm import trange
 
 from .constants import DATASET_DICT, DATASETS, MEAN, STD
 from .data_utils import resize_depth, resize_flow, to_float_tensor, to_tensor
+from ufo.paper_contract import split_context_supervision
 
 logger = logging.getLogger("UFO")
 
@@ -135,6 +138,12 @@ class UFODataset(Dataset):
         for annotation_path in annotation_paths:
             with open(os.path.join(data_root, annotation_path), "r") as f:
                 self.annotations.append(json.load(f))
+        self._instance_cache = OrderedDict()
+        self._instance_scene_manifest = None
+        instance_manifest = getattr(args, "instance_scene_index_manifest", None) if args is not None else None
+        if instance_manifest:
+            with open(instance_manifest) as handle:
+                self._instance_scene_manifest = json.load(handle)["scenes"]
         logger.info(f"Loaded {len(self.annotations)} annotations.")
         self.num_replicas = num_replicas
         if self.num_replicas > 1:
@@ -151,6 +160,64 @@ class UFODataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.annotations)
+
+    def _with_instances(self, scene_json):
+        if "instances_info" in scene_json and "frame_instances" in scene_json:
+            return scene_json
+        cache_key = scene_json["scene_name"]
+        if cache_key in self._instance_cache:
+            self._instance_cache.move_to_end(cache_key)
+            instances_info, frame_instances = self._instance_cache[cache_key]
+        else:
+            if "instances_info_path" in scene_json:
+                instances_info_path = scene_json["instances_info_path"]
+                frame_instances_path = scene_json["frame_instances_path"]
+            elif self._instance_scene_manifest is not None:
+                relative_dir = self._instance_scene_manifest.get(scene_json["scene_name"])
+                if relative_dir is None:
+                    raise KeyError(
+                        f"scene {scene_json['scene_name']} is absent from instance manifest"
+                    )
+                instance_dir = Path(self.data_root) / relative_dir
+                instances_info_path = instance_dir / "instances_info.json"
+                frame_instances_path = instance_dir / "frame_instances.json"
+            else:
+                first_image = next(iter(scene_json["relative_image_path"].values()))[0]
+                scene_relative = Path(first_image).parent.parent
+                instance_dir = Path(self.data_root) / "datasets" / scene_json["dataset"] / scene_relative / "instances"
+                instances_info_path = instance_dir / "instances_info.json"
+                frame_instances_path = instance_dir / "frame_instances.json"
+            with open(instances_info_path) as handle:
+                instances_info = json.load(handle)
+            with open(frame_instances_path) as handle:
+                frame_instances = json.load(handle)
+            if self._instance_scene_manifest is not None and instances_info:
+                distances = []
+                ego_poses = scene_json.get("ego_pose", scene_json.get("ego_to_world", []))
+                for instance in instances_info.values():
+                    annotations = instance.get("frame_annotations", {})
+                    for frame, pose in zip(
+                        annotations.get("frame_idx", [])[:1],
+                        annotations.get("obj_to_world", [])[:1],
+                    ):
+                        if frame < len(ego_poses):
+                            distances.append(np.linalg.norm(
+                                np.asarray(pose, dtype=np.float64)[:3, 3]
+                                - np.asarray(ego_poses[frame], dtype=np.float64)[:3, 3]
+                            ))
+                if distances and min(distances) > 300.0:
+                    raise ValueError(
+                        "instance/scene alignment failed for "
+                        f"{scene_json['scene_name']}: nearest object is {min(distances):.1f}m "
+                        f"from ego; source={instances_info_path}"
+                    )
+            self._instance_cache[cache_key] = (instances_info, frame_instances)
+            while len(self._instance_cache) > 2:
+                self._instance_cache.popitem(last=False)
+        scene_json = scene_json.copy()
+        scene_json["instances_info"] = instances_info
+        scene_json["frame_instances"] = frame_instances
+        return scene_json
 
     def get_frame(
         self,
@@ -181,9 +248,6 @@ class UFODataset(Dataset):
 
         c2w_real_cur_frame = np.array(cam_to_world[ref_camera_name][source_frame_idx])
         c2w_real_global = np.array(cam_to_world[ref_camera_name][global_source_frame_idx])
-
-        ### cur_frame with global orientation
-        c2w_real_cur_frame[:3, :3] = c2w_real_global[:3, :3]
 
         world_to_canonical = np.linalg.inv(c2w_real_cur_frame)
         world_to_canonical_global = np.linalg.inv(c2w_real_global)
@@ -329,12 +393,12 @@ class UFODataset(Dataset):
             # instances_pose_ts = torch.zeros(num_instances, 4, 4)
             instances_pose_ts = torch.eye(4).reshape(1, 4, 4).repeat(num_instances, 1, 1)
             instances_id_ts = torch.zeros(num_instances, ).type(torch.int64)
+            instances_track_id_ts = torch.full((num_instances,), -1, dtype=torch.int64)
             instances_corner_ts = torch.zeros(num_instances, 8, 3)
+            instances_corner_local_ts = torch.zeros(num_instances, 8, 3)
 
 
-            instances_pose, instances_id, instances_corner = [], [], []
-
-            for inst_id in available_instances:
+            for slot, inst_id in enumerate(available_instances[:num_instances]):
                 # if inst_id in cur_frame_instances and instances_info[str(inst_id)]['class_name'] == 'Vehicle':
                 # if frame_idx in instances_info[str(inst_id)]['frame_annotations']['frame_idx']:
                 #     list_frame_idx = instances_info[str(inst_id)]['frame_annotations']['frame_idx'].index(frame_idx)
@@ -345,7 +409,10 @@ class UFODataset(Dataset):
                 # else:
                 #     list_frame_idx = bisect.bisect(instances_info[str(inst_id)]['frame_annotations']['frame_idx'], inst_id)
 
-                list_frame_idx = find_closest_idx(instances_info[str(inst_id)]['frame_annotations']['frame_idx'], frame_idx)
+                annotated_frames = instances_info[str(inst_id)]['frame_annotations']['frame_idx']
+                if frame_idx not in annotated_frames:
+                    continue
+                list_frame_idx = annotated_frames.index(frame_idx)
 
                 inst2world_real = np.array(instances_info[str(inst_id)]['frame_annotations']['obj_to_world'][list_frame_idx], dtype=np.float64)
                 inst2world = (
@@ -353,21 +420,29 @@ class UFODataset(Dataset):
                     @ world_to_canonical_global
                     @ inst2world_real
                 )
-                instances_pose.append(torch.from_numpy(inst2world).type(torch.float32))
+                inst2local = (
+                    DATASETS[dataset_name]["canonical_to_flu"]
+                    @ world_to_canonical
+                    @ inst2world_real
+                )
+                instances_pose_ts[slot] = torch.from_numpy(inst2world).type(torch.float32)
 
                 inst_box_size = np.array(instances_info[str(inst_id)]['frame_annotations']['box_size'][list_frame_idx], dtype=np.float64)
 
-                instances_corner.append(torch.from_numpy(get_box_corners(inst2world, inst_box_size)).type(torch.float32))
-                instances_id.append(torch.tensor(1).type(torch.int64))
-            num_valid = min(num_instances, len(instances_pose))
-            if num_valid > 0:
-                instances_pose_ts[:num_valid] = torch.stack(instances_pose)[:num_valid]
-                instances_corner_ts[:num_valid] = torch.stack(instances_corner)[:num_valid]
-                instances_id_ts[:num_valid] = torch.stack(instances_id)[:num_valid]
+                instances_corner_ts[slot] = torch.from_numpy(
+                    get_box_corners(inst2world, inst_box_size)
+                ).type(torch.float32)
+                instances_corner_local_ts[slot] = torch.from_numpy(
+                    get_box_corners(inst2local, inst_box_size)
+                ).type(torch.float32)
+                instances_id_ts[slot] = 1
+                instances_track_id_ts[slot] = int(inst_id)
         else:
             instances_pose_ts = None
             instances_corner_ts = None
+            instances_corner_local_ts = None
             instances_id_ts = None
+            instances_track_id_ts = None
 
         frame_images = torch.stack(images)
         frame_depths = torch.stack(depths) if len(depths) > 0 else None
@@ -392,8 +467,9 @@ class UFODataset(Dataset):
             "dynamic_masks": frame_dynamic_masks,
             "ground_masks": ground_masks,
             "instances_corner": instances_corner_ts,
-            "instances_corner_local": instances_corner_ts - toglobal_translation.reshape(1, 1, 3),
+            "instances_corner_local": instances_corner_local_ts,
             "instances_id": instances_id_ts,
+            "instances_track_id": instances_track_id_ts,
             "instances_pose": instances_pose_ts
         }
 
@@ -404,7 +480,7 @@ class UFODataset(Dataset):
         ):
         if True:
             N = self.num_target_chunks
-            scene_json = self.annotations[index % len(self.annotations)]
+            scene_json = self._with_instances(self.annotations[index % len(self.annotations)])
             scene_id = scene_json["scene_id"]
             num_timesteps = scene_json["num_timesteps"]
             fps = scene_json["fps"]
@@ -470,7 +546,10 @@ class UFODataset(Dataset):
                 
                 
                 # Generate context frame indices for this window
-                if self.equispaced:
+                if getattr(self.args, "paper_frame_protocol", False):
+                    frame_protocol = split_context_supervision(window_start, window_end)
+                    window_context_indices = np.asarray(frame_protocol.context)
+                elif self.equispaced:
                     window_context_indices = np.arange(
                         window_start,
                         window_end,
@@ -503,7 +582,11 @@ class UFODataset(Dataset):
 
                 reverse = self.reverse
                 # Generate target frame indices for this window
-                if return_all:
+                if getattr(self.args, "paper_frame_protocol", False):
+                    # The paper fixes the frame partition but does not disclose
+                    # whether training renders these frames per chunk or from S_T.
+                    target_frame_idx = np.asarray(frame_protocol.supervision)
+                elif return_all:
                     # Return all frames in this window
                     if reverse:
                         target_frame_idx = np.arange(window_start, target_window_end)
@@ -566,7 +649,7 @@ class UFODataset(Dataset):
                     context_dict = self.get_frame(
                         scene_json=scene_json,
                         frame_idx=ctx_id,
-                        source_frame_idx=window_end,
+                        source_frame_idx=window_context_indices[0],
                         global_source_frame_idx=last_frame_idx,
                         available_instances=available_instances
                     )
@@ -588,7 +671,7 @@ class UFODataset(Dataset):
                     target_dict = self.get_frame(
                         scene_json=scene_json,
                         frame_idx=target_id,
-                        source_frame_idx=window_end,
+                        source_frame_idx=window_context_indices[0],
                         global_source_frame_idx=last_frame_idx,
                         available_instances=available_instances
                     )
@@ -623,6 +706,8 @@ class UFODataset(Dataset):
                     "window_start_frame": window_start,  # Add start frame of this window
                     "global_frame": global_frame
                 }
+                sample["sample_start_frame"] = int(initial_start_frame)
+                sample["sample_scene_index"] = int(index % len(self.annotations))
                 value_list.append(to_float_tensor(sample))
             
             # get gs frames
@@ -708,4 +793,3 @@ class UFODatasetEval(UFODataset):
             self.val_sample_list[index][1],
             return_all=True,
         )
-

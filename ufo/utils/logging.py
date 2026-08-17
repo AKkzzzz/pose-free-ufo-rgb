@@ -134,7 +134,9 @@ class MetricLogger:
             iter_time=iter_time,
             data_time=data_time,
         )
-        dict_to_dump.update({k: v.median for k, v in self.meters.items()})
+        # JSONL is the machine-readable experiment record; keep the exact value
+        # for this iteration rather than the human-facing smoothed median.
+        dict_to_dump.update({k: v.value for k, v in self.meters.items()})
         with open(self.output_file, "a") as f:
             f.write(json.dumps(dict_to_dump) + "\n")
 

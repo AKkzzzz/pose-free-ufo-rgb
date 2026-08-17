@@ -20,6 +20,7 @@ from ..modules import (
     TimestepEmbedder,
 )
 from ..vit import Mlp, VisionTransformer as ViT
+from ufo.paper_contract import split_aux_tokens
 import numpy as np
 import torch
 from plyfile import PlyData, PlyElement
@@ -177,6 +178,19 @@ def points_in_boxes_probability(points, boxes, valid_mask, temperature=0.1, back
     probs = torch.softmax(all_scores, dim=2)  # [B, N, M+1]
     
     return probs
+
+
+def expand_spatial_token_assignments(token_weights, views, height, width, patch_size=8):
+    """Broadcast each patch token to its spatially corresponding Gaussians."""
+    b, t, tokens_per_time, classes = token_weights.shape
+    patch_h, patch_w = height // patch_size, width // patch_size
+    expected = views * patch_h * patch_w
+    if tokens_per_time != expected:
+        raise ValueError(f"expected {expected} tokens/time, got {tokens_per_time}")
+    weights = token_weights.reshape(b, t, views, patch_h, patch_w, classes)
+    return weights.repeat_interleave(patch_size, 3).repeat_interleave(patch_size, 4)
+
+
 def construct_list_of_attributes():
     """Construct the list of attributes for the PLY file header."""
     l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -197,7 +211,8 @@ def transform_gaussian_means_with_instances(
     context_instances_pose,  # [B, T_context, N_box, 4, 4]
     target_instances_pose,   # [B, T_target, N_box, 4, 4]
     means,                   # [B, T_context, N_gs, 3]
-    probabilities           # [B, T_context, N_gs, N_box]
+    probabilities,          # [B, T_context, N_gs, N_box]
+    stable_delta=False,
 ):
     """
     Transform 3D Gaussian means according to dynamic instance movements.
@@ -263,12 +278,65 @@ def transform_gaussian_means_with_instances(
     probs_exp = probabilities.unsqueeze(2).unsqueeze(-1)
     
     # Weighted sum over boxes: [B, T_context, T_target, N_gs, 3]
-    weighted_means = (transformed_means * probs_exp).sum(dim=-2)
+    if stable_delta:
+        # Compute motion without ever multiplying a large absolute world
+        # coordinate by identity in BF16. This is algebraically equivalent to
+        # (R_tgt R_ctx^T x + t_tgt - R_tgt R_ctx^T t_ctx) - x.
+        relative_r = torch.matmul(tgt_R_exp, ctx_R_exp.transpose(-2, -1))
+        identity = torch.eye(3, dtype=relative_r.dtype, device=relative_r.device)
+        motion_delta = torch.einsum(
+            '...ij,...j->...i', relative_r - identity, means_exp - ctx_t_exp
+        ) + tgt_t_exp - ctx_t_exp
+        weighted_means = means.unsqueeze(2) + (motion_delta * probs_exp).sum(dim=-2)
+    else:
+        weighted_means = (transformed_means * probs_exp).sum(dim=-2)
     
     # Reorder to [B, T_target, T_context, N_gs, 3]
     target_means = weighted_means.transpose(1, 2)
     
     return target_means
+
+
+def _quaternion_multiply(left, right):
+    """Hamilton product for scalar-first (w, x, y, z) quaternions."""
+    lw, lx, ly, lz = left.unbind(dim=-1)
+    rw, rx, ry, rz = right.unbind(dim=-1)
+    return torch.stack(
+        [
+            lw * rw - lx * rx - ly * ry - lz * rz,
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+        ],
+        dim=-1,
+    )
+
+
+def transform_gaussian_quats_with_instances(
+    context_instances_pose, target_instances_pose, quats, probabilities
+):
+    """Apply probability-weighted relative Waymo box yaw to GS rotations."""
+    ctx_r = context_instances_pose[..., :3, :3]
+    tgt_r = target_instances_pose[..., :3, :3]
+    relative_r = torch.einsum("btkij,bsklj->btskil", tgt_r, ctx_r)
+    relative_yaw = torch.atan2(relative_r[..., 1, 0], relative_r[..., 0, 0])
+    half_yaw = 0.5 * relative_yaw
+    delta = torch.stack(
+        [torch.cos(half_yaw), torch.zeros_like(half_yaw), torch.zeros_like(half_yaw), torch.sin(half_yaw)],
+        dim=-1,
+    )
+
+    # [B, T_context, T_target, N_gs, N_box, 4]
+    transformed = _quaternion_multiply(
+        delta.permute(0, 2, 1, 3, 4).unsqueeze(3),
+        F.normalize(quats, dim=-1).unsqueeze(2).unsqueeze(4),
+    )
+    reference = transformed[..., :1, :]
+    sign = torch.where((transformed * reference).sum(dim=-1, keepdim=True) < 0, -1.0, 1.0)
+    weighted = (transformed * sign * probabilities.unsqueeze(2).unsqueeze(-1)).sum(dim=-2)
+    return F.normalize(weighted, dim=-1).transpose(1, 2)
+
+
 def corners_to_params(corners):
     """
     Convert 3D bounding box corners to parametric representation.
@@ -485,7 +553,6 @@ class UFO(ViT):
         num_heads=12,
         grad_checkpointing=True,
         use_latest_gsplat=False,
-        sigmoid_rgb=False, # a legacy oversight: the sigmoid was accidentally omitted in the earlier implementation
         static=False,
         num_mem_tokens=0,
         args=None,
@@ -531,9 +598,9 @@ class UFO(ViT):
         self.num_bbox = args.num_bbox
         ## bbox embedder
 
-        # self.bbox_embed = Mlp(31, 32, embed_dim)
         self.bbox_time_embed = Mlp(embed_dim, embed_dim, embed_dim)
-        self.bbox_embed = nn.Linear(31, embed_dim)
+        # Hidden width and activation are not disclosed; use the ViT MLP convention.
+        self.bbox_embed = Mlp(31, embed_dim, embed_dim)
         self.background_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
         # used for upscaling the low-resolution image features to the pixel-resolution
         # very handcrafted and never tuned
@@ -548,7 +615,7 @@ class UFO(ViT):
             LayerNorm2d(128),
             nn.GELU(),
         )
-        self.bbox_query_head = Mlp(128, 256, projected_motion_dim)
+        self.bbox_query_head = Mlp(embed_dim, embed_dim, projected_motion_dim)
         self.bbox_key_head = Mlp(self.embed_dim, self.embed_dim, projected_motion_dim)
 
         ###==========================================================================
@@ -567,6 +634,9 @@ class UFO(ViT):
             kernel_size=8,
             stride=8
         )
+        # The paper requires local xyz to accompany the 768-D old feature but
+        # does not disclose this projection's hidden width or activation.
+        self.scene_position_embed = Mlp(3, embed_dim, embed_dim)
 
         # ------- auxiliary tokens -------
         self.use_sky_token = use_sky_token
@@ -602,8 +672,11 @@ class UFO(ViT):
 
         # ------- gs predictor and mask decoder -------
         if decoder_type == "dummy":
-            self.gs_pred = nn.Linear(embed_dim, decoder_upsample_ratio**2 * self.out_channels)
-            self.gs_life_pred = nn.Linear(embed_dim, decoder_upsample_ratio ** 2)
+            decoder_output_dim = decoder_upsample_ratio**2 * (self.out_channels + 1)
+            if getattr(args, "gaussian_decoder_layers", "mlp2") == "linear":
+                self.gs_pred = nn.Linear(embed_dim, decoder_output_dim)
+            else:
+                self.gs_pred = Mlp(embed_dim, embed_dim, decoder_output_dim)
             if self.num_memory_tokens > 0 and self.enable_mem_gs:
                 self.mem_gs_pred = nn.Linear(embed_dim, decoder_upsample_ratio ** 2 * 14)
             else:
@@ -674,7 +747,7 @@ class UFO(ViT):
 
         # self.xyz_act_fn = lambda x: far * torch.tanh(x / 50)
         # self.xyz_act_fn = lambda x: x
-        self.rgb_act_fn = lambda x: torch.sigmoid(x) * 2 - 1 if sigmoid_rgb else x
+        self.rgb_act_fn = lambda x: x
         self.near, self.far = near, far
 
         # ------- motion predictor -------
@@ -699,6 +772,11 @@ class UFO(ViT):
             self.memory_tokens = None
 
         self.init_weights()
+        if self.use_affine_token and self.args.paper_affine_transform:
+            nn.init.zeros_(self.affine_linear.weight)
+            identity_affine = torch.cat([torch.eye(self.gs_dim), torch.zeros(self.gs_dim, 1)], dim=1)
+            with torch.no_grad():
+                self.affine_linear.bias.copy_(identity_affine.flatten())
         if posterior:
             init_to_zero_output(self.adaptor_posterior_output)
             # init_to_zero_output(self.adaptor_posterior_input)
@@ -799,7 +877,10 @@ class UFO(ViT):
 
 
 
-    def init_posterior_gs_from_rays(self, posterior_gs, posterior_gs_dirs, posterior_gs_origins, posterior_gs_time):
+    def init_posterior_gs_from_rays(
+        self, posterior_gs, posterior_gs_dirs, posterior_gs_origins,
+        posterior_gs_time, posterior_gs_xyz
+    ):
         """
         posterior_gs: [B, L, D=768] (D: same dimension as other features)
         posterior_gs_dirs: [B, L, 8, 8, 3]
@@ -836,7 +917,9 @@ class UFO(ViT):
         ray_features = rearrange(ray_features, '(b l) d 1 1 -> b l d', b=B, l=L)
 
         # 3. Combine with existing posterior_gs features (residual connection)
-        combined_features = posterior_gs + ray_features
+        combined_features = (
+            posterior_gs + ray_features + self.scene_position_embed(posterior_gs_xyz)
+        )
 
         # 4. Add time embedding
         # TimestepEmbedder expects 1D tensor of time values [N] -> outputs [N, embed_dim]
@@ -1065,56 +1148,54 @@ class UFO(ViT):
     
 
     def forward_motion_predictor_bbox(self, data_dict, gs_params):
-
         x = data_dict['gs_state']
         b, t, v, h, w, _ = gs_params["means"].shape
+        tokens_per_time = x.shape[1] // t
+        if tokens_per_time * t != x.shape[1]:
+            raise ValueError("scene-token count must be divisible by context timesteps")
 
+        token_queries = self.bbox_query_head(x.reshape(b, t, tokens_per_time, -1))
+        bbox_keys = self.bbox_key_head(data_dict['bbox_feature'])
+        token_weights = []
+        token_logits = []
+        for time_index in range(t):
+            time_keys = torch.cat([
+                bbox_keys[:, :1],
+                bbox_keys[:, 1 + time_index * self.num_bbox:1 + (time_index + 1) * self.num_bbox],
+            ], dim=1)
+            logits = torch.einsum(
+                "b n c,b k c->b n k", token_queries[:, time_index], time_keys
+            )
+            if getattr(self.args, "mask_invalid_bbox_tokens", False):
+                valid_bbox = data_dict['context_instances_id'][:, time_index].bool()
+                valid_keys = torch.cat([
+                    torch.ones(b, 1, dtype=torch.bool, device=valid_bbox.device), valid_bbox
+                ], dim=-1)
+                logits = logits.masked_fill(~valid_keys[:, None], float("-inf"))
+            scaled_logits = logits / self.tau
+            token_logits.append(scaled_logits)
+            token_weights.append(torch.softmax(scaled_logits, dim=-1))
 
-        # if False:
-        #     x = self.relative_gs_decoder(x[..., 3:])
-
-        # todo: add gs means information
-
-
-        # B L D -> (B T N_cam) D H' W'
-        img_embeds = self.unpatchify(
-            rearrange(x, "b (t v hw) c -> (b t v) hw c", t=t, v=v),
-            hw=(h // self.unpatch_size, w // self.unpatch_size),
-            patch_size=1,
+        bbox_token_weights = torch.stack(token_weights, dim=1)
+        bbox_token_logits = torch.stack(token_logits, dim=1)
+        flat_token_weights = bbox_token_weights.reshape(b, -1, 1 + self.num_bbox)
+        spatial_gaussian_weights = expand_spatial_token_assignments(
+            bbox_token_weights, v, h, w, self.unpatch_size
         )
-
-        # output_upscaling is a seriece of upconvnet with net effect: channel 768 -> 128, H' W' -> H W (restores original size)
-        if False:
-            img_embeds = checkpoint(self.output_upscaling, img_embeds, use_reentrant=False)
-        else:
-            img_embeds = self.output_upscaling(img_embeds)
-        img_embeds = rearrange(img_embeds, "(b t v) c h w -> b t v h w c", t=t, v=v) # B, T, N_cam, H, W, 128
-
-
-
-        if True:
-            img_queries = self.bbox_query_head(img_embeds)
-            bbox_keys = self.bbox_key_head(data_dict['bbox_feature'])
-            bbox_weights = torch.zeros(b, t, v, h, w, 1 + self.num_bbox).to(img_queries)
-            for _t in range(t):
-
-                _bbox_keys = torch.cat([bbox_keys[:, :1], bbox_keys[:, 1 + _t * self.num_bbox : 1 + (_t + 1) * self.num_bbox]], dim=1)
-                _img_queries = img_queries[:, _t]
-                _dot_product_similarity = torch.einsum(
-                    "b k c, b v h w c -> b v h w k",
-                    _bbox_keys,
-                    _img_queries
-                )
-
-                # TODO mask out invalid keys
-                # data_dict['context_instances_id']
-
-                _bbox_weights = torch.softmax(_dot_product_similarity / self.tau, dim=-1)
-                bbox_weights[:, _t] = _bbox_weights
-
-
-        data_dict['bbox_weights'] = bbox_weights
-
+        data_dict['bbox_token_weights'] = flat_token_weights
+        data_dict['bbox_token_logits'] = bbox_token_logits.reshape(b, -1, 1 + self.num_bbox)
+        data_dict['bbox_weights'] = spatial_gaussian_weights
+        data_dict['gs_token_means'] = rearrange(
+            F.avg_pool2d(
+                rearrange(gs_params['means'], 'b t v h w c -> (b t v) c h w'),
+                kernel_size=self.unpatch_size,
+                stride=self.unpatch_size,
+            ),
+            '(b t v) c ph pw -> b (t v ph pw) c',
+            b=b,
+            t=t,
+            v=v,
+        )
         return data_dict
 
 
@@ -1152,13 +1233,9 @@ class UFO(ViT):
         # gs_pred is a linear layer with input dim 768 output dim 768 
         # this is a coincidence, the out dimension is 768 because 768 = 8 ^ 2 x 12
         gs_params = self.gs_pred(x)
-        gs_lifespan = self.gs_life_pred(x)
         # note here each token(patch) predicts patch_size ^ 2 gaussians
         gs_params = self.unpatchify(gs_params, hw=(h, w), patch_size=self.unpatch_size)
         gs_params = rearrange(gs_params, "(b t v) c h w -> b t v h w c", t=t, v=v)
-        gs_lifespan = self.unpatchify(gs_lifespan, hw=(h, w), patch_size=self.unpatch_size)
-        gs_lifespan = rearrange(gs_lifespan, "(b t v) c h w -> b t v h w c", t=t, v=v)
-        gs_params = torch.cat([gs_params, gs_lifespan], dim=-1)
         if return_whole:
             return gs_params
         depth, scales, quats, opacitys, colors, lifespan = gs_params.split([1, 3, 4, 1, self.gs_dim, 1], dim=-1)
@@ -1196,42 +1273,129 @@ class UFO(ViT):
         ### transform gaussian means
 
         probabilities = rearrange(data_dict['bbox_weights'], "b t v h w k -> b t (v h w) k")
+        token_probabilities = rearrange(
+            data_dict['bbox_token_weights'], "b (t n) k -> b t n k", t=t
+        )
+        token_logits = rearrange(
+            data_dict['bbox_token_logits'], "b (t n) k -> b t n k", t=t
+        )
         t_means = rearrange(gs_params["means"], "b t v h w c -> b t (v h w) c")
+        token_means = rearrange(data_dict['gs_token_means'], "b (t n) c -> b t n c", t=t)
 
 
         with torch.no_grad():
-            gt_prob = torch.zeros_like(probabilities)
-            ### TODO: should be able to avoid loop
+            gt_prob = torch.zeros_like(token_probabilities)
             for _t in range(t):
-                gt_prob[:, _t] = points_in_boxes_probability(t_means[:, _t].detach(), data_dict['context_instances_corner'][:, _t], data_dict['context_instances_id'][:, _t], temperature=0.01)
+                gt_prob[:, _t] = points_in_boxes_probability(
+                    token_means[:, _t].detach(),
+                    data_dict['context_instances_corner'][:, _t],
+                    data_dict['context_instances_id'][:, _t],
+                    temperature=0.01,
+                )
 
-        gt_prob = gt_prob.argmax(dim=-1)
-        loss_mask = gt_prob.float() > -1
+        gt_soft_prob = gt_prob
+        gt_prob = gt_soft_prob.argmax(dim=-1)
+        loss_mask = torch.ones_like(gt_prob, dtype=torch.bool)
         loss_gt_prob = gt_prob[loss_mask]
-        loss_pred_porb = probabilities[loss_mask]
-        log_probs = torch.log(loss_pred_porb + 1e-8)  # Add small epsilon to avoid log(0)
+        loss_pred_porb = token_probabilities[loss_mask]
+        loss_pred_logits = token_logits[loss_mask]
+        log_probs = F.log_softmax(loss_pred_logits, dim=-1)
 
-        class_weights = torch.ones(self.num_bbox + 1)
-        class_weights[0] = 1e-1
-        class_weights = class_weights / class_weights.sum()
-        class_weights = class_weights.to(log_probs.device)  # Move to same device
-
-        loss = F.nll_loss(log_probs, loss_gt_prob, weight=class_weights)
-        data_dict['class_loss'] = loss * 1e-2
-
+        if loss_gt_prob.numel() == 0:
+            loss = token_probabilities.sum() * 0.0
+        else:
+            class_weight = torch.ones(
+                token_probabilities.shape[-1], device=log_probs.device, dtype=log_probs.dtype
+            )
+            class_weight[0] = self.args.object_assignment_background_weight
+            loss = F.cross_entropy(loss_pred_logits, loss_gt_prob, weight=class_weight)
+        data_dict['class_loss'] = loss * self.args.object_assignment_loss_coeff
+        data_dict['object_supervised_token_ratio'] = loss_mask.float().mean()
+        if loss_gt_prob.numel():
+            data_dict['object_assignment_accuracy'] = (
+                loss_pred_porb.argmax(dim=-1) == loss_gt_prob
+            ).float().mean()
+        dynamic_gt_mask = loss_gt_prob > 0
+        data_dict['object_dynamic_gt_ratio'] = dynamic_gt_mask.float().mean()
+        data_dict['object_dynamic_gt_count'] = dynamic_gt_mask.sum()
+        if dynamic_gt_mask.any():
+            dynamic_predictions = loss_pred_porb[dynamic_gt_mask].argmax(dim=-1)
+            data_dict['object_dynamic_assignment_accuracy'] = (
+                dynamic_predictions == loss_gt_prob[dynamic_gt_mask]
+            ).float().mean()
+            data_dict['object_dynamic_background_error_ratio'] = (
+                dynamic_predictions == 0
+            ).float().mean()
+            data_dict['object_foreground_recall'] = (
+                dynamic_predictions > 0
+            ).float().mean()
+        predicted_foreground = loss_pred_porb.argmax(dim=-1) > 0
+        if loss_pred_porb.numel():
+            data_dict['object_predicted_dynamic_ratio'] = predicted_foreground.float().mean()
+            data_dict['object_background_probability'] = loss_pred_porb[..., 0].mean()
+            data_dict['object_assignment_entropy'] = -(
+                loss_pred_porb * torch.log(loss_pred_porb.clamp_min(1e-8))
+            ).sum(dim=-1).mean()
+        if predicted_foreground.any():
+            data_dict['object_foreground_precision'] = (
+                loss_gt_prob[predicted_foreground] > 0
+            ).float().mean()
+        background_gt = loss_gt_prob == 0
+        if background_gt.any():
+            data_dict['object_background_precision'] = (
+                loss_pred_porb[background_gt].argmax(dim=-1) == 0
+            ).float().mean()
 
         dummy_context_instance_pose = torch.eye(4).reshape(1, 1, 1, 4, 4).repeat(b, t, 1, 1, 1).to(probabilities)
         dummy_target_instance_pose = torch.eye(4).reshape(1, 1, 1, 4, 4).repeat(b, tgt_t, 1, 1, 1).to(probabilities)
 
         ### bbox not related to time
-        transformed_means = transform_gaussian_means_with_instances(
-            torch.cat([dummy_context_instance_pose, data_dict['context_instances_pose']], dim=2),  # [B, T_context, N_box, 4, 4]
-            torch.cat([dummy_target_instance_pose, data_dict['target_instances_pose']], dim=2),   # [B, T_target, N_box, 4, 4]
-            t_means,                   # [B, T_context, N_gs, 3]
-            probabilities           # [B, T_context, N_gs, N_box]
+        context_instance_poses = torch.cat([dummy_context_instance_pose, data_dict['context_instances_pose']], dim=2)
+        target_instance_poses = torch.cat([dummy_target_instance_pose, data_dict['target_instances_pose']], dim=2)
+        valid_pose = (
+            data_dict['context_instances_id'][:, :, None].bool()
+            & data_dict['target_instances_id'][:, None].bool()
         )
+        data_dict['bbox_valid_count'] = data_dict['context_instances_id'].sum()
+        if valid_pose.any():
+            context_pose = data_dict['context_instances_pose'][:, :, None]
+            target_pose = data_dict['target_instances_pose'][:, None]
+            pose_translation = (
+                target_pose[..., :3, 3] - context_pose[..., :3, 3]
+            ).norm(dim=-1)[valid_pose]
+            relative_rotation = (
+                target_pose[..., :3, :3]
+                @ context_pose[..., :3, :3].transpose(-2, -1)
+            )
+            pose_yaw = torch.rad2deg(torch.atan2(
+                relative_rotation[..., 1, 0], relative_rotation[..., 0, 0]
+            ).abs())[valid_pose]
+            data_dict['bbox_pose_mean_translation'] = pose_translation.mean()
+            data_dict['bbox_pose_max_translation'] = pose_translation.max()
+            data_dict['bbox_pose_mean_rotation_deg'] = pose_yaw.mean()
+            data_dict['bbox_pose_max_rotation_deg'] = pose_yaw.max()
+        transformed_means = transform_gaussian_means_with_instances(
+            context_instance_poses,  # [B, T_context, N_box, 4, 4]
+            target_instance_poses,   # [B, T_target, N_box, 4, 4]
+            t_means,                   # [B, T_context, N_gs, 3]
+            probabilities,          # [B, T_context, N_gs, N_box]
+            stable_delta=getattr(self.args, "stable_bbox_delta_transform", False),
+        )
+        data_dict['bbox_motion_mean_displacement'] = (
+            transformed_means - t_means[:, None]
+        ).norm(dim=-1).mean()
+        data_dict['bbox_motion_max_displacement'] = (
+            transformed_means - t_means[:, None]
+        ).norm(dim=-1).max()
 
         transformed_means = rearrange(transformed_means, "b t v n c -> (b t) (v n) c")
+        transformed_quats = None
+        if self.args.paper_bbox_rotation:
+            t_quats = rearrange(gs_params["quats"], "b t v h w c -> b t (v h w) c")
+            transformed_quats = transform_gaussian_quats_with_instances(
+                context_instance_poses, target_instance_poses, t_quats, probabilities
+            )
+            transformed_quats = rearrange(transformed_quats, "b t v n c -> (b t) (v n) c")
 
 
         ntk_dynamic = forward_v.shape[1]
@@ -1260,6 +1424,8 @@ class UFO(ViT):
         means_batched = means.repeat_interleave(tgt_t, dim=0)
         scales_batched = scales.repeat_interleave(tgt_t, dim=0)
         quats_batched = quats.repeat_interleave(tgt_t, dim=0)
+        if transformed_quats is not None:
+            quats_batched = transformed_quats
         opacities_batched = opacities.repeat_interleave(tgt_t, dim=0)
         color_batched = colors.repeat_interleave(tgt_t, dim=0)
         forward_v_batched = forward_v.repeat_interleave(tgt_t, dim=0)
@@ -1282,9 +1448,18 @@ class UFO(ViT):
 
 
         ### lifespan for opacity
-        enable_lifespan = False
-        if enable_lifespan:
-            opacities_batched = opacities_batched * torch.exp(- 0.5 * tdiff_forward_batched ** 2 * lifespan_batched).squeeze(-1)
+        if self.args.enable_lifespan_renderer:
+            if self.args.lifespan_parameterization == "paper_beta":
+                # Paper beta is a temporal standard deviation: exp(-dt^2 / (2 beta^2)).
+                temporal_opacity = torch.exp(
+                    -0.5 * tdiff_forward_batched ** 2 / lifespan_batched.clamp_min(1e-6).square()
+                )
+            else:
+                # Official v1 variable acts as temporal precision despite its lifespan name.
+                temporal_opacity = torch.exp(
+                    -0.5 * tdiff_forward_batched ** 2 * lifespan_batched
+                )
+            opacities_batched = opacities_batched * temporal_opacity.squeeze(-1)
             
 
 
@@ -1306,6 +1481,7 @@ class UFO(ViT):
         Ks_batched = data_dict["target_intrinsics"].view(b * tgt_t, -1, 3, 3)
 
         motion_seg = None
+        motion_assignment_weights = None
 
 
         # replace means batched 
@@ -1451,12 +1627,10 @@ class UFO(ViT):
                             )
                             weights = weights.split([weights.size(-1) - 1, 1], dim=-1)[0]
                             assignment_map.append(weights)
-                        motion_seg = torch.cat(assignment_map, dim=-1)
-
-
-                        motion_seg = motion_seg.reshape(b, tgt_t, tgt_v, tgt_h, tgt_w, -1).argmax(
-                            dim=-1
+                        motion_assignment_weights = torch.cat(assignment_map, dim=-1).reshape(
+                            b, tgt_t, tgt_v, tgt_h, tgt_w, -1
                         )
+                        motion_seg = motion_assignment_weights.argmax(dim=-1)
             else:
                 with torch.autocast("cuda", enabled=False):
                     rendered_color, rendered_alpha, _ = rasterization(
@@ -1485,6 +1659,9 @@ class UFO(ViT):
         }
         if motion_seg is not None:
             output_dict["rendered_motion_seg"] = motion_seg.squeeze(-1)
+        if motion_assignment_weights is not None:
+            output_dict["rendered_assignment_weights"] = motion_assignment_weights
+            output_dict["rendered_background_assignment"] = motion_assignment_weights[..., 0]
         # Add rendered lifespan when not training
         if not self.training and 'rendered_lifespan' in locals():
             output_dict["rendered_lifespan"] = rendered_lifespan.view(b, tgt_t, tgt_v, tgt_h, tgt_w)
@@ -1531,18 +1708,30 @@ class UFO(ViT):
         data_dict, ray_dict = self.get_ray_dict(data_dict)
 
         data_dict["gs_time"] = data_dict["context_time"]
-        # re-initailize mis feature every time
-        mis_feature = self.init_feature_mis(batch_size=b)
+        if self.args.recurrent_aux_tokens and data_dict.get('posterior_aux_state') is not None:
+            mis_feature = data_dict['posterior_aux_state']
+            self.num_mis_feature = mis_feature.shape[1]
+        else:
+            mis_feature = self.init_feature_mis(batch_size=b)
         img_feature = self.init_feature_image(context_imgs, ray_dict["plucker"], data_dict["context_time"]) # [B, T_context, N_cam, 3, H, W] -> [B, L, D]
 
         if 'posterior_gs_origins' in data_dict:
-            posterior_gs_feature = self.init_feature_from_patch(
-                data_dict['posterior_image'],
-                data_dict['posterior_gs_origins'],
-                data_dict['posterior_gs_dirs'],
-                data_dict['posterior_gs_time'],
-                setnum=False,
-            )
+            if self.args.scene_token_input == "latent":
+                posterior_gs_feature = self.init_posterior_gs_from_rays(
+                    data_dict['posterior_gs'],
+                    data_dict['posterior_gs_dirs'],
+                    data_dict['posterior_gs_origins'],
+                    data_dict['posterior_gs_time'],
+                    data_dict['posterior_gs_xyz'],
+                )
+            else:
+                posterior_gs_feature = self.init_feature_from_patch(
+                    data_dict['posterior_image'],
+                    data_dict['posterior_gs_origins'],
+                    data_dict['posterior_gs_dirs'],
+                    data_dict['posterior_gs_time'],
+                    setnum=False,
+                )
 
             num_posterior_features = posterior_gs_feature.shape[1]
 
@@ -1572,17 +1761,19 @@ class UFO(ViT):
 
 
         sky_token, affine_tokens, motion_tokens = None, None, None
-        if self.use_sky_token:
-            sky_token = x[:, :1]
-            x = x[:, 1:]
-
-        if self.use_affine_token:
-            affine_tokens = x[:, : self.num_cams]
-            x = x[:, self.num_cams :]
-
-        if self.num_motion_tokens > 0:
-            motion_tokens = x[:, : self.num_motion_tokens]
-            x = x[:, self.num_motion_tokens :]
+        if self.use_sky_token and self.use_affine_token:
+            sky_token, affine_tokens, motion_tokens = split_aux_tokens(
+                mis_feature, self.num_cams, self.num_motion_tokens
+            )
+        else:
+            aux_output = mis_feature
+            if self.use_sky_token:
+                sky_token, aux_output = aux_output[:, :1], aux_output[:, 1:]
+            if self.use_affine_token:
+                affine_tokens = aux_output[:, :self.num_cams]
+                aux_output = aux_output[:, self.num_cams:]
+            if self.num_motion_tokens > 0:
+                motion_tokens = aux_output[:, :self.num_motion_tokens]
         
         data_dict['sky_token'] = sky_token
         data_dict['affine_tokens'] = affine_tokens
@@ -1674,7 +1865,13 @@ class UFO(ViT):
             affine_tokens = data_dict['affine_tokens']
             affine = self.affine_linear(affine_tokens)  # b v (gs_dim * (gs_dim + 1))
             affine = rearrange(affine, "b v (p q) -> b v p q", p=self.gs_dim)
-            images = torch.einsum("b t v h w p, b v p q -> b t v h w p", images, affine) # affine 居然是负的，无语了
+            if self.args.paper_affine_transform:
+                color_matrix, color_bias = affine[..., :self.gs_dim], affine[..., self.gs_dim]
+                images = torch.einsum(
+                    "b t v h w q, b v p q -> b t v h w p", images, color_matrix
+                ) + color_bias[:, None, :, None, None, :]
+            else:
+                images = torch.einsum("b t v h w p, b v p q -> b t v h w p", images, affine)
             data_dict["gs_params"]["affine"] = affine
         else:
             images = -images

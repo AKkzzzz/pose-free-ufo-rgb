@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 
 logger = logging.getLogger("UFO")
@@ -186,7 +187,10 @@ class Transformer(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         for block in self.blocks:
-            x = block(x)
+            if self.grad_checkpointing and self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         return x
 
 

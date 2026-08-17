@@ -14,7 +14,6 @@
 
 import logging
 import time
-from ipdb import iex
 import imageio
 import numpy as np
 import torch
@@ -312,7 +311,6 @@ def rotation_matrix_to_quaternion(R):
 # ============================================================================
 
 @torch.no_grad()
-@iex
 def make_video(
     args,
     dataset,

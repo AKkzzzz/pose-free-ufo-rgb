@@ -19,7 +19,7 @@ from einops import rearrange
 from ufo.dataset.constants import MEAN, STD
 
 
-def compute_depth_loss(pred_depth, gt_depth, max_depth=None):
+def compute_depth_loss(pred_depth, gt_depth, max_depth=None, normalization="target_max"):
     pred_depth = pred_depth.squeeze()
     gt_depth = gt_depth.squeeze()
     if pred_depth.shape != gt_depth.shape:
@@ -45,10 +45,17 @@ def compute_depth_loss(pred_depth, gt_depth, max_depth=None):
             )
             pred_depth = rearrange(pred_depth, "(b t v) 1 h w -> b t v h w", b=b, t=t, v=v)
     valid_mask = gt_depth > 0.01
-    if max_depth is None:
-        max_depth = gt_depth.max()
-    pred_depth = pred_depth[valid_mask] / max_depth
-    gt_depth = gt_depth[valid_mask] / max_depth
+    pred_depth = pred_depth[valid_mask]
+    gt_depth = gt_depth[valid_mask]
+    if pred_depth.numel() == 0:
+        return pred_depth.sum()
+    if normalization == "target_max":
+        if max_depth is None:
+            max_depth = gt_depth.max()
+        pred_depth = pred_depth / max_depth
+        gt_depth = gt_depth / max_depth
+    elif normalization != "raw":
+        raise ValueError(f"Unsupported depth normalization: {normalization}")
     return F.l1_loss(pred_depth, gt_depth)
 
 
@@ -76,19 +83,24 @@ def compute_sky_depth_loss(pred_depth, gt_sky_mask, sky_depth: float = 1e3, flow
         flow = rearrange(flow, "(b t v) c h w -> b t v h w c", b=b, t=t, v=v)
         # penalize flow in sky region
         sky_flow = flow[gt_sky_mask > 0]
-        sky_flow_reg_loss = F.mse_loss(sky_flow, torch.zeros_like(sky_flow))
+        sky_flow_reg_loss = (
+            F.mse_loss(sky_flow, torch.zeros_like(sky_flow))
+            if sky_flow.numel() else sky_flow.sum()
+        )
     else:
         sky_flow_reg_loss = torch.tensor(0.0).to(pred_depth.device)
 
     sky_region = gt_sky_mask > 0
     pred_depth = pred_depth[sky_region]
+    if pred_depth.numel() == 0:
+        return pred_depth.sum(), sky_flow_reg_loss
     return (
         F.mse_loss(pred_depth / sky_depth, torch.ones_like(pred_depth)) * 0.01,
         sky_flow_reg_loss,
     )
 
 
-def compute_lifespan_reg_loss(gs_params):
+def compute_lifespan_reg_loss(gs_params, parameterization="official_precision"):
     """
     Compute L1 regularization loss on lifespan to encourage persistent Gaussians.
 
@@ -105,7 +117,10 @@ def compute_lifespan_reg_loss(gs_params):
         return torch.tensor(0.0)
 
     lifespan = gs_params["lifespan"]
-    # L1 penalty: encourages low lifespan (persistent Gaussians)
+    if parameterization == "paper_beta":
+        # Paper Eq. (lifespan): mean(1 / beta), so large beta means persistence.
+        return lifespan.clamp_min(1e-6).reciprocal().mean()
+    # Official v1 behavior: L1 on a value used as temporal precision.
     return torch.abs(lifespan).mean()
 
 
@@ -124,12 +139,18 @@ def compute_loss(output_dict, target_dict, args=None, lpips_loss=None):
 
     if args.enable_depth_loss and "target_depth" in target_dict:
         pred_depth, target_depth = pred_dict[pred_dict["depth_key"]], target_dict["target_depth"]
-        depth_loss = compute_depth_loss(pred_depth, target_depth)
-        loss_dict["depth_loss"] = depth_loss
+        depth_loss = compute_depth_loss(
+            pred_depth, target_depth,
+            normalization=getattr(args, "depth_loss_normalization", "target_max"),
+        )
+        loss_dict["depth_loss"] = getattr(args, "depth_loss_coeff", 1.0) * depth_loss
 
         if pred_dict["decoder_depth_key"] is not None:
             pred_decoder_depth = pred_dict[pred_dict["decoder_depth_key"]]
-            decoded_depth_loss = compute_depth_loss(pred_decoder_depth, target_depth)
+            decoded_depth_loss = compute_depth_loss(
+                pred_decoder_depth, target_depth,
+                normalization=getattr(args, "depth_loss_normalization", "target_max"),
+            )
             loss_dict["decoded_depth_loss"] = decoded_depth_loss
             if (
                 args.enable_sky_depth_loss or args.enable_sky_opacity_loss
@@ -141,18 +162,25 @@ def compute_loss(output_dict, target_dict, args=None, lpips_loss=None):
                 )
                 loss_dict["sky_decodede_depth_loss"] = sky_decoded_depth_loss
 
-    if args.enable_flow_reg_loss and pred_dict["flow_key"] is not None and 'forward_flow' in gs_params:
-        pred_flow = gs_params["forward_flow"]
-        zero_flow = torch.zeros_like(gs_params["forward_flow"]).to(device)
-        forward_flow_reg = F.mse_loss(pred_flow, zero_flow, reduction="none")
-        loss_dict["flow_reg_loss"] = args.flow_reg_coeff * forward_flow_reg.mean()
+    if args.enable_flow_reg_loss:
+        if pred_dict["flow_key"] is not None and 'forward_flow' in gs_params:
+            pred_flow = gs_params["forward_flow"]
+            zero_flow = torch.zeros_like(gs_params["forward_flow"]).to(device)
+            forward_flow_reg = F.mse_loss(pred_flow, zero_flow, reduction="none")
+            loss_dict["flow_reg_loss"] = args.flow_reg_coeff * forward_flow_reg.mean()
+        else:
+            # Full bbox motion in public v1 never produces forward_flow. Keep the
+            # requested metric visible without inventing the paper's missing head.
+            loss_dict["flow_reg_loss"] = pred_rgb.sum() * 0.0
 
     # Lifespan L1 regularization: encourages persistent Gaussians (low lifespan)
     # L1 provides "selection functionality" - most Gaussians persistent, few can be transient
     # Enabled by default (args.enable_lifespan_reg_loss defaults to True)
     enable_lifespan_loss = getattr(args, 'enable_lifespan_reg_loss', True)
     if enable_lifespan_loss and 'lifespan' in gs_params:
-        lifespan_reg_loss = compute_lifespan_reg_loss(gs_params)
+        lifespan_reg_loss = compute_lifespan_reg_loss(
+            gs_params, getattr(args, 'lifespan_parameterization', 'official_precision')
+        )
         lifespan_coeff = getattr(args, 'lifespan_reg_coeff', 0.01)
         loss_dict["lifespan_reg_loss"] = lifespan_coeff * lifespan_reg_loss
 
@@ -166,10 +194,11 @@ def compute_loss(output_dict, target_dict, args=None, lpips_loss=None):
         )
         loss_dict["sky_depth_loss"] = sky_depth_loss
         loss_dict["sky_flow_reg_loss"] = sky_flow_reg_loss
-        loss_dict["opacity_loss"] = 0.01 * F.mse_loss(
-            pred_dict[pred_dict["alpha_key"]],
-            torch.ones_like(pred_dict[pred_dict["alpha_key"]]),
-        )
+        if getattr(args, "legacy_sky_full_opacity_loss", False):
+            loss_dict["opacity_loss"] = 0.01 * F.mse_loss(
+                pred_dict[pred_dict["alpha_key"]],
+                torch.ones_like(pred_dict[pred_dict["alpha_key"]]),
+            )
         if pred_dict["decoder_depth_key"] is not None:
             (sky_decoded_depth_loss, sky_decoded_flow_reg_loss,) = compute_sky_depth_loss(
                 pred_dict[pred_dict["decoder_depth_key"]],
@@ -184,7 +213,7 @@ def compute_loss(output_dict, target_dict, args=None, lpips_loss=None):
             loss_dict["sky_decodede_depth_loss"] = sky_decoded_depth_loss
             loss_dict["sky_decoded_flow_reg_loss"] = sky_decoded_flow_reg_loss
 
-    elif args.enable_sky_opacity_loss and "target_sky_masks" in target_dict:
+    if args.enable_sky_opacity_loss and "target_sky_masks" in target_dict:
         opacity = pred_dict[pred_dict["alpha_key"]].squeeze(-1)
         b, t, v, h, w = opacity.shape
         gt_h, gt_w = target_dict["target_sky_masks"].shape[-2:]

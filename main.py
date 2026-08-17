@@ -14,12 +14,15 @@
 
 import argparse
 import copy
+import contextlib
 import datetime
+import hashlib
 import json
 import logging
 import math
 import os
 import shutil
+import subprocess
 import sys
 import time
 from ufo.utils.misc import update_scene
@@ -44,12 +47,13 @@ from ufo.dataset.samplers import InfiniteSampler, NoPaddingDistributedSampler
 from ufo.dataset.dataset import UFODataset, UFODatasetEval
 from ufo.utils.logging import MetricLogger, WandbLogger, setup_logging
 from ufo.utils.losses import compute_loss
+from ufo.utils.diagnostics import gaussian_metrics, parameter_grad_norms, reconstruction_metrics
 from ufo.utils.lpips_loss import RGBLpipsLoss
 from ufo.utils.misc import NativeScalerWithGradNormCount as NativeScaler
 from ufo.utils.misc import combine_dict_entries, project_boxes_to_image, convert_to_chunks
-from ipdb import iex
 from ufo.utils.misc import compute_point_visibility, compute_visible_topk_indices_any_view, batched_index_gather, batched_index_update
 from ufo.ar import val
+from ufo.paper_contract import assert_paper_training_ready
 from typing import Dict, Any, Optional
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -203,7 +207,7 @@ class TensorBoardLogger:
 # ============================================================================
 
 def get_args_parser():
-    parser = argparse.ArgumentParser("UFO training", add_help=False)
+    parser = argparse.ArgumentParser("UFO training")
 
     # =============== Configuration file ================= #
     parser.add_argument("--config", type=str, default=None,
@@ -221,6 +225,8 @@ def get_args_parser():
     parser.add_argument("--use_sky_token", action="store_true")
     parser.add_argument("--use_affine_token", action="store_true")
     parser.add_argument("--use_latest_gsplat", action="store_true")
+    parser.add_argument("--max_gaussian_scale", default=0.5, type=float,
+                        help="Hard upper bound applied after exponential Gaussian scale activation.")
     parser.add_argument(
         "--decoder_type",
         type=str,
@@ -232,6 +238,10 @@ def get_args_parser():
 
     # =============== Losses =============== #
     parser.add_argument("--enable_depth_loss", action="store_true")
+    parser.add_argument("--depth_loss_coeff", type=float, default=1.0,
+                        help="Depth-loss multiplier; 1.0 preserves the public implementation.")
+    parser.add_argument("--depth_loss_normalization", choices=["target_max", "raw"],
+                        default="target_max", help="Depth L1 units used by the objective.")
 
     # Option 1: push the sky depth to a fixed value
     parser.add_argument("--enable_sky_depth_loss", action="store_true")
@@ -264,6 +274,55 @@ def get_args_parser():
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--grad_clip", type=float, default=3.0, help="Gradient clip")
     parser.add_argument("--disable_grad_checkpointing", action="store_true")
+    parser.add_argument("--sequential_chunk_backward", action="store_true",
+                        help="Backward each detached recurrent chunk immediately, then take one optimizer step.")
+    parser.add_argument("--gradient_accumulation_steps", default=1, type=int,
+                        help="Dataloader microbatches per optimizer step; independent of recurrent chunks.")
+    parser.add_argument("--detach_scene_between_chunks", action="store_true",
+                        help="Detach all recurrent scene tensors between chunks (truncated recurrent gradients).")
+    parser.add_argument("--allow_old_scene_grad", action="store_true",
+                        help="Keep old latent scene tokens attached for recurrent BPTT.")
+    parser.add_argument("--gaussian_decoder_layers", choices=["linear", "mlp2"], default="mlp2",
+                        help="Official-v1 Linear or paper-described 2-layer Gaussian decoder.")
+    parser.add_argument("--scene_token_input", choices=["official_rgb", "latent"], default="official_rgb",
+                        help="Encode visible old tokens from stored RGB (v1) or recurrent latent state (paper path).")
+    parser.add_argument("--attention_mode", choices=["official_v1_dense"], default="official_v1_dense",
+                        help="Released v1 dense SDPA. The paper custom flex-attention mask is not public.")
+    parser.add_argument("--enable_lifespan_renderer", action="store_true",
+                        help="Apply temporal Gaussian opacity in the renderer.")
+    parser.add_argument("--lifespan_parameterization", choices=["official_precision", "paper_beta"],
+                        default="official_precision")
+    parser.add_argument("--object_assignment_loss_coeff", type=float, default=0.01)
+    parser.add_argument("--object_assignment_background_weight", type=float, default=0.1)
+    parser.add_argument("--object_soft_target_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--instance_scene_index_manifest",
+        type=str,
+        default=None,
+        help="Optional scene-name mapping for Waymo instances; prevents annotation/index mismatch.",
+    )
+    parser.add_argument("--recurrent_aux_tokens", action="store_true",
+                        help="Carry updated sky/affine auxiliary tokens across recurrent chunks.")
+    parser.add_argument("--legacy_sky_full_opacity_loss", action="store_true",
+                        help="Keep the extra v1 full-image opacity-to-one loss when sky-depth loss is active.")
+    parser.add_argument("--disable_legacy_time_offset", action="store_true",
+                        help="Keep dataset-global normalized time instead of forcing every chunk context to -1.")
+    parser.add_argument("--paper_affine_transform", action="store_true",
+                        help="Use the paper A*c+b transform with identity initialization.")
+    parser.add_argument("--paper_bbox_rotation", action="store_true",
+                        help="Apply soft bbox-guided relative yaw to Gaussian quaternions.")
+    parser.add_argument("--mask_invalid_bbox_tokens", action="store_true",
+                        help="Exclude padded bbox tokens from soft assignment (v1 TODO fix).")
+    parser.add_argument("--stable_bbox_delta_transform", action="store_true",
+                        help="Blend bbox motion deltas instead of absolute means for BF16 stability.")
+    parser.add_argument("--paper_frame_protocol", action="store_true",
+                        help="Use every fifth frame as context and every other frame as supervision.")
+    parser.add_argument("--paper_supervision_mode", choices=["unknown", "per_chunk", "final_scene"],
+                        default="unknown", help="Undisclosed paper training render/loss timing.")
+    parser.add_argument("--paper_forward_flow_impl", action="store_true",
+                        help="Set only when an evidence-backed paper forward-flow implementation exists.")
+    parser.add_argument("--allow_missing_paper_components", action="store_true",
+                        help="Sprint-only override; logs missing flow/mask components without claiming contract equivalence.")
 
     parser.add_argument("--start_iteration", default=0, type=int, help="start iteration")
     parser.add_argument("--num_iterations", default=200_000, type=int, help="num of iterations")
@@ -281,6 +340,8 @@ def get_args_parser():
     parser.add_argument("--load_ground", action="store_true")
     parser.add_argument("--load_depth", action="store_true")
     parser.add_argument("--load_flow", action="store_true")
+    parser.add_argument("--load_dynamic_mask", action="store_true",
+                        help="Load preprocessed dynamic masks for dynamic-region diagnostics.")
     parser.add_argument("--dataset", default="waymo", type=str, choices=DATASET_DICT.keys())
     parser.add_argument("--subset_ratio", default=1.0, type=float)
     parser.add_argument("--num_workers", default=16, type=int)
@@ -292,6 +353,10 @@ def get_args_parser():
     parser.add_argument("--vis_every_n_iters", type=int, default=5000)
     parser.add_argument("--ckpt_every_n_iters", type=int, default=5000)
     parser.add_argument("--eval_every_n_iters", type=int, default=50000)
+    parser.add_argument(
+        "--validation_steps", default="",
+        help="Comma-separated optimizer steps for held-out validation.",
+    )
     parser.add_argument("--total_elapsed_time", type=float, default=0.0, help="total time elapsed")
     parser.add_argument("--keep_n_ckpts", default=5, type=int)
 
@@ -300,6 +365,8 @@ def get_args_parser():
     parser.add_argument("--device", default="cuda", help="device to use for training / testing")
     parser.add_argument("--visualization_only", action="store_true")
     parser.add_argument("--evaluate", action="store_true")
+    parser.add_argument("--skip_initial_validation", action="store_true")
+    parser.add_argument("--skip_final_evaluation", action="store_true")
 
     # ============= WandB and TensorBoard ============= #
     parser.add_argument("--enable_wandb", action="store_true")
@@ -356,6 +423,48 @@ def backup_python_files(backup_dir):
     return backup_dir
 
 
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def save_run_manifest(args, world_size, train_annotation, val_annotation):
+    def git(*command):
+        return subprocess.check_output(["git", *command], text=True).strip()
+
+    tracked_inputs = {
+        "train_scene_list": train_annotation,
+        "validation_scene_list": val_annotation,
+        "instance_scene_manifest": args.instance_scene_index_manifest,
+    }
+    manifest = {
+        "command": [sys.executable, *sys.argv],
+        "git_commit": git("rev-parse", "HEAD"),
+        "git_status": git("status", "--short"),
+        "git_diff_stat": git("diff", "--stat"),
+        "seed": args.seed,
+        "resolved_config": vars(args),
+        "training_scale": {
+            "world_size": world_size,
+            "batch_size_per_gpu": args.batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "effective_batch": world_size * args.batch_size * args.gradient_accumulation_steps,
+            "sequences_per_optimizer_step": world_size * args.batch_size * args.gradient_accumulation_steps,
+            "chunks_per_sequence": args.num_target_chunks,
+            "optimizer_step_definition": "one AdamW update after gradient_accumulation_steps sequences",
+        },
+        "inputs": {},
+    }
+    for name, path in tracked_inputs.items():
+        if path and os.path.exists(path):
+            manifest["inputs"][name] = {"path": path, "sha256": _sha256(path)}
+    with open(os.path.join(args.log_dir, "run_manifest.json"), "w") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+
+
 # ============================================================================
 # MAIN TRAINING FUNCTION
 # ============================================================================
@@ -382,9 +491,11 @@ def main(args):
     misc.fix_random_seeds(seed)
 
     log_writer = None
-    if global_rank == 0 and args.enable_tensorboard:
-        [os.makedirs(d, exist_ok=True) for d in [log_dir, checkpoint_dir, video_dir, backup_dir, tensorboard_dir]]
+    if global_rank == 0:
+        [os.makedirs(d, exist_ok=True) for d in [log_dir, checkpoint_dir, video_dir, backup_dir]]
 
+    if global_rank == 0 and args.enable_tensorboard:
+        os.makedirs(tensorboard_dir, exist_ok=True)
         # Backup all Python files
         backup_python_files(backup_dir)
         
@@ -458,6 +569,7 @@ def main(args):
         num_max_cams=args.num_max_cameras,
         load_depth=args.load_depth,
         load_flow=args.load_flow,
+        load_dynamic_mask=args.load_dynamic_mask,
         skip_sky_mask=args.skip_sky_mask,
         num_target_chunks=args.num_target_chunks,
         static=args.static,
@@ -486,6 +598,7 @@ def main(args):
             num_max_cams=args.num_max_cameras,
             load_depth=args.load_depth,
             load_flow=args.load_flow,
+            load_dynamic_mask=args.load_dynamic_mask,
             skip_sky_mask=args.skip_sky_mask,
             num_target_chunks=args.num_target_chunks,
             static=args.static,
@@ -587,8 +700,10 @@ def main(args):
         grad_checkpointing=not args.disable_grad_checkpointing,
         use_sky_token=args.use_sky_token,
         use_affine_token=args.use_affine_token,
+        num_cams=args.num_max_cameras,
         num_motion_tokens=args.num_motion_tokens,
         use_latest_gsplat=args.use_latest_gsplat,
+        max_scale=args.max_gaussian_scale,
         static=args.static,
         num_mem_tokens=args.num_mem_tokens,
         args=args
@@ -603,10 +718,15 @@ def main(args):
     if distributed.is_enabled():
         model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         model_without_ddp = model.module
-    global_batch_size = args.batch_size * world_size
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be >= 1")
+    global_batch_size = args.batch_size * world_size * args.gradient_accumulation_steps
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * global_batch_size / 256
-    logger.info("Global batch size: %d" % global_batch_size)
+    logger.info(
+        "Effective global batch size: %d (%d GPUs x %d/GPU x %d accumulation)",
+        global_batch_size, world_size, args.batch_size, args.gradient_accumulation_steps,
+    )
     logger.info(f"Base lr: {args.lr * 256 / global_batch_size:.2e}, Actual lr: {args.lr:.2e}")
 
     # ========================================================================
@@ -655,7 +775,8 @@ def main(args):
     if dataset_val is not None and valid_slice_id >= len(dataset_val):
         valid_slice_id = 0
 
-    val(args, model_without_ddp, dataset_val, log_writer=log_writer, output_prefix=os.path.join(args.log_dir, "videos", f"{data_iter_step:07d}"))
+    if not args.skip_initial_validation:
+        val(args, model_without_ddp, dataset_val, log_writer=log_writer, output_prefix=os.path.join(args.log_dir, "videos", f"{data_iter_step:07d}"))
 
     if args.visualization_only:
         logger.info("Visualization done, exiting.")
@@ -666,33 +787,58 @@ def main(args):
         enable_perceptual_loss=args.enable_perceptual_loss,
     ).to(device)
     rgb_and_lpips_loss.set_perceptual_loss(False)
-
     # ========================================================================
     # Training loop
     # ========================================================================
 
+    if args.allow_missing_paper_components:
+        logger.warning(
+            "MISSING_PAPER_COMPONENT: sprint override active; forward-flow and flex-mask gaps remain"
+        )
+    else:
+        assert_paper_training_ready(args)
+
     logger.info(f"Starting training from iteration {args.start_iteration} to {args.num_iterations}")
+    if distributed.is_main_process():
+        save_run_manifest(args, world_size, train_annotation, val_annotation)
     metrics_file = os.path.join(args.log_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
     start_time = time.time()
     num_tokens_printed = False
-
+    micro_step = args.start_iteration * args.gradient_accumulation_steps
+    validation_steps = {
+        int(step) for step in args.validation_steps.split(",") if step.strip()
+    }
     for data_dict in metric_logger.log_every(
         data_loader_train,
         print_freq=args.log_every_n_iters,
         header="Training",
-        n_iterations=args.num_iterations,
-        start_iteration=args.start_iteration,
+        n_iterations=args.num_iterations * args.gradient_accumulation_steps,
+        start_iteration=micro_step,
     ):
-        if data_iter_step > args.num_iterations:
+        if micro_step >= args.num_iterations * args.gradient_accumulation_steps:
             break
+        accumulation_index = micro_step % args.gradient_accumulation_steps
+        should_step = accumulation_index == args.gradient_accumulation_steps - 1
+        if accumulation_index == 0:
+            optimizer.zero_grad()
+            accumulation_loss_dict = {}
+            accumulation_metric_dict = {}
+            accumulation_scene_diagnostics = []
+            misc.adjust_learning_rate(optimizer, data_iter_step, args)
         if log_writer is not None:
             log_writer.set_step(data_iter_step)
         if args.enable_perceptual_loss and data_iter_step >= args.perceptual_loss_start_iter:
             rgb_and_lpips_loss.set_perceptual_loss(True)
 
         model.train()
-        misc.adjust_learning_rate(optimizer, data_iter_step, args)
+        if (
+            world_size > 1
+            and hasattr(model, "no_sync")
+            and args.gradient_accumulation_steps > 1
+            and not args.sequential_chunk_backward
+        ):
+            raise ValueError("DDP accumulation currently requires --sequential_chunk_backward")
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             # Forward pass and loss computation
@@ -701,38 +847,142 @@ def main(args):
 
 
             all_gs_features = {}
+            loss_dict_accum = {}
 
             if args.reverse:
-                range_inout = range(len(inout_dicts) - 1, -1, -1)
+                range_inout = list(range(len(inout_dicts) - 1, -1, -1))
             else:
-                range_inout = range(len(inout_dicts))
+                range_inout = list(range(len(inout_dicts)))
+            final_scene_supervision = args.paper_supervision_mode == "final_scene"
+            final_scene_inputs = []
+            final_scene_update_outputs = []
+
             # Autoregressive processing loop
-            for i in range_inout:
+            for chunk_position, i in enumerate(range_inout):
                 input_dict, target_dict = inout_dicts[i]
 
-                # Set previous state variables for recurrent processing
-                pred_dict, all_gs_features = update_scene(input_dict, model, scene=all_gs_features, export_ply=False, profile=False, filter_num=args.filter_num, log_dir=args.log_dir)
-                loss_dict = compute_loss(pred_dict, target_dict, args, rgb_and_lpips_loss)
-                loss_dict.update({'class_loss': pred_dict['class_loss']})
+                sync_now = should_step and chunk_position == len(range_inout) - 1
+                sync_context = (
+                    contextlib.nullcontext()
+                    if (
+                        world_size == 1
+                        or not hasattr(model, "no_sync")
+                        or sync_now
+                        or not args.sequential_chunk_backward
+                    )
+                    else model.no_sync()
+                )
+                with sync_context:
+                    pred_dict, all_gs_features = update_scene(
+                        input_dict, model, scene=all_gs_features, export_ply=False,
+                        profile=False, render=not final_scene_supervision,
+                        filter_num=args.filter_num, log_dir=args.log_dir,
+                        detach_old_scene=not args.allow_old_scene_grad,
+                    )
+                    if final_scene_supervision:
+                        final_scene_inputs.append((input_dict, target_dict))
+                        final_scene_update_outputs.append(pred_dict)
+                    else:
+                        loss_dict = compute_loss(pred_dict, target_dict, args, rgb_and_lpips_loss)
+                        loss_dict.update({'class_loss': pred_dict['class_loss']})
+                        if 'ray_loss' in pred_dict:
+                            loss_dict.update({'ray_loss': pred_dict['ray_loss']})
+                        nonfinite_losses = {
+                            key: value.detach().float().cpu().tolist()
+                            for key, value in loss_dict.items()
+                            if torch.is_tensor(value) and not torch.isfinite(value).all()
+                        }
+                        if nonfinite_losses:
+                            nonfinite_predictions = {
+                                key: tuple(value.shape)
+                                for key, value in pred_dict.items()
+                                if torch.is_tensor(value) and not torch.isfinite(value).all()
+                            }
+                            logger.error(
+                                "Non-finite chunk=%d context_frames=%s target_frames=%s "
+                                "losses=%s predictions=%s",
+                                i,
+                                input_dict.get("frame_idx"),
+                                target_dict.get("frame_idx"),
+                                nonfinite_losses,
+                                nonfinite_predictions,
+                            )
+                        loss_value = sum(loss for k, loss in loss_dict.items() if "loss" in k)
+                        for key, value in loss_dict.items():
+                            loss_dict_accum[key] = loss_dict_accum.get(key, 0.0) + value.detach()
+                        if args.sequential_chunk_backward:
+                            if not args.detach_scene_between_chunks:
+                                raise ValueError("--sequential_chunk_backward requires --detach_scene_between_chunks")
+                            loss_scaler.backward(loss_value / args.gradient_accumulation_steps)
+                            loss_total += loss_value.detach()
+                        else:
+                            loss_total += loss_value
 
-                if 'ray_loss' in pred_dict:
-                    loss_dict.update({'ray_loss': pred_dict['ray_loss']})
+                if not final_scene_supervision:
+                    with torch.no_grad():
+                        chunk_metrics = reconstruction_metrics(pred_dict, target_dict)
+                        chunk_metrics.update(gaussian_metrics(pred_dict, args.max_gaussian_scale))
+                        for key, value in chunk_metrics.items():
+                            accumulation_metric_dict[key] = accumulation_metric_dict.get(key, 0.0) + value
+                    accumulation_scene_diagnostics.append(pred_dict.get("scene_diagnostics", {}))
 
-                loss_value = sum(loss for k, loss in loss_dict.items() if "loss" in k)
-                loss_total += loss_value
+                if args.detach_scene_between_chunks:
+                    all_gs_features = misc.detach_tensors(all_gs_features)
+
+            if final_scene_supervision:
+                if args.sequential_chunk_backward:
+                    raise ValueError("final_scene supervision requires one backward after all renders")
+                for (render_source, target_dict), update_output in zip(
+                    final_scene_inputs, final_scene_update_outputs
+                ):
+                    render_input = render_source.copy()
+                    render_input.update(all_gs_features)
+                    render_input = model(render_input, stage=2, motion=False)
+                    pred_dict = model(render_input, stage=3)
+                    loss_dict = compute_loss(pred_dict, target_dict, args, rgb_and_lpips_loss)
+                    if 'class_loss' in update_output:
+                        loss_dict['class_loss'] = update_output['class_loss']
+                    if 'ray_loss' in update_output:
+                        loss_dict['ray_loss'] = update_output['ray_loss']
+                    loss_value = sum(loss for key, loss in loss_dict.items() if "loss" in key)
+                    loss_total += loss_value
+                    for key, value in loss_dict.items():
+                        loss_dict_accum[key] = loss_dict_accum.get(key, 0.0) + value.detach()
+                    with torch.no_grad():
+                        chunk_metrics = reconstruction_metrics(pred_dict, target_dict)
+                        chunk_metrics.update(gaussian_metrics(pred_dict, args.max_gaussian_scale))
+                        for key, value in chunk_metrics.items():
+                            accumulation_metric_dict[key] = accumulation_metric_dict.get(key, 0.0) + value
+
+            loss_dict = {key: value / len(inout_dicts) for key, value in loss_dict_accum.items()}
+            for key, value in loss_dict.items():
+                accumulation_loss_dict[key] = accumulation_loss_dict.get(key, 0.0) + value
 
         if not math.isfinite(loss_total):
             logger.info("NaN detected")
             raise AssertionError
 
-        grad_norm = loss_scaler(
-            loss_total,
-            optimizer,
-            parameters=model.parameters(),
-            clip_grad=args.grad_clip,
+        if not args.sequential_chunk_backward:
+            loss_scaler.backward(loss_total / args.gradient_accumulation_steps)
+
+        micro_step += 1
+        if not should_step:
+            continue
+
+        grad_norm = loss_scaler.step(
+            optimizer, parameters=model.parameters(), clip_grad=args.grad_clip
         )
+        grad_group_norms = parameter_grad_norms(model_without_ddp)
         optimizer.zero_grad()
         torch.cuda.synchronize()
+        loss_dict = {
+            key: value / args.gradient_accumulation_steps
+            for key, value in accumulation_loss_dict.items()
+        }
+        diagnostic_divisor = args.gradient_accumulation_steps * len(inout_dicts)
+        training_diagnostics = {
+            key: value / diagnostic_divisor for key, value in accumulation_metric_dict.items()
+        }
         if world_size > 1:
             [torch.distributed.all_reduce(v) for v in loss_dict.values()]
         loss_dict_reduced = {k: v.item() / world_size for k, v in loss_dict.items()}
@@ -741,6 +991,8 @@ def main(args):
         psnr = -10 * np.log10(loss_dict_reduced["rgb_loss"])
         metric_logger.update(lr=lr, psnr=psnr, loss=total_loss_reduced, **loss_dict_reduced)
         metric_logger.update(grad_norm=grad_norm)
+        metric_logger.update(peak_gpu_mb=torch.cuda.max_memory_allocated() / (1024 ** 2))
+        metric_logger.update(**training_diagnostics, **grad_group_norms)
 
         if "num_tokens" in pred_dict and not num_tokens_printed:
             logger.info(f"num_tokens: {pred_dict['num_tokens']}")
@@ -754,8 +1006,18 @@ def main(args):
                     **{f"train/{k}": v for k, v in loss_dict_reduced.items()},
                     "train/lr": lr,
                     "train/grad_norm": grad_norm,
+                    **{f"train/{k}": v for k, v in training_diagnostics.items()},
+                    **{f"train/{k}": v for k, v in grad_group_norms.items()},
                 }
             )
+            for diagnostic in accumulation_scene_diagnostics[-len(inout_dicts):]:
+                chunk = diagnostic.get("chunk")
+                if chunk is not None:
+                    log_writer.update({
+                        f"scene/chunk{chunk}/{key}": value
+                        for key, value in diagnostic.items()
+                        if key != "chunk" and isinstance(value, (int, float))
+                    })
             # Flush TensorBoard periodically
             if isinstance(log_writer, TensorBoardLogger) and data_iter_step % 100 == 0:
                 log_writer.flush()
@@ -780,7 +1042,11 @@ def main(args):
             torch.distributed.barrier()
             torch.cuda.empty_cache()
 
-        if (data_iter_step + 1) % args.vis_every_n_iters == 0:
+        completed_step = data_iter_step + 1
+        if (
+            completed_step in validation_steps
+            or (args.vis_every_n_iters > 0 and completed_step % args.vis_every_n_iters == 0)
+        ):
             val(args, model_without_ddp, dataset_val, log_writer=log_writer, output_prefix=os.path.join(args.log_dir, "videos", f"{data_iter_step:07d}"))
 
         data_iter_step += 1
@@ -794,6 +1060,9 @@ def main(args):
     total_time = time.time() - start_time + args.total_elapsed_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info("Training time {}".format(total_time_str))
+    if args.skip_final_evaluation:
+        logger.info("Skipping final evaluation by request.")
+        return
     eval_result = evaluate(data_loader_eval, model_without_ddp, args)
     if log_writer is not None and eval_result is not None:
         log_writer.update({f"eval/{k}": v for k, v in eval_result.items()})
@@ -828,4 +1097,3 @@ if __name__ == "__main__":
     args = merge_config_and_args(parser, config_path=config_path)
 
     main(args)
-
