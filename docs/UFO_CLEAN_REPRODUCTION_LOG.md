@@ -5,6 +5,7 @@
 - Base: official UFO commit `85e4223ffd07badb2dbb6b9bce1815764ccdb82e`
 - Branch: `ufo_clean_reproduction_v1`
 - Run: `clean_repro_uniform_eb8_seed1`
+- Training commit: `5199f7e21e9cbf34f3cfe140def40273e34f2f4b`
 - Config: `configs/clean_reproduction/ufo_clean_uniform_eb8_10k.json`
 - Data: Waymo train/validation scene lists plus corrected scene-name instance manifest
 - Target paper metric (2s): 27.26 PSNR / 0.825 SSIM / 5.45 m D-RMSE
@@ -28,16 +29,19 @@
 
 | Optimizer step | PSNR | SSIM | D-RMSE (m) | Delta PSNR to paper | Trend / gate |
 |---:|---:|---:|---:|---:|---|
-| 0 | pending | pending | pending | pending | initialization |
+| 0 | 10.1248 | 0.3270 | 172.87 | -17.1352 | random initialization |
 | 1,000 | pending | pending | pending | pending | health check only |
 | 3,000 | pending | pending | pending | pending | health check only |
 | 5,000 | pending | pending | pending | pending | warmup boundary |
 | 7,500 | pending | pending | pending | pending | trend |
 | 10,000 | pending | pending | pending | pending | first capability gate |
 
-Launch state: queued behind the independent post-warmup diagnostic on the only
-available GPU. The queue runs one exact-EB8 random-initialization optimizer-step
-smoke, then starts the 10k command only if the smoke exits successfully.
+Launch state: running on the only available RTX 4090 (PID `1010217`). The exact
+EB8 random-initialization smoke passed with finite loss and nonzero Transformer,
+Gaussian, bbox, and affine gradients. Steady-state training is about 1.9-2.1
+seconds per microbatch with about 21 GB peak GPU memory. The run manifest records
+a clean worktree and hashes the train list, validation list, and corrected
+scene-name instance manifest.
 
 Gate: if 5k to 10k PSNR is still rising materially, continue to 25k without
 structural changes. Only a clear plateau far below the paper result reopens the
