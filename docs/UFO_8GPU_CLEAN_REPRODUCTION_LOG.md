@@ -36,3 +36,19 @@
 - Warmup: 5,000 optimizer steps to `1e-4`; LPIPS activates at step 5,000.
 - Flow and flex-attention remain `MISSING_PAPER_COMPONENT`; no diagnostic vehicle losses are enabled.
 - Capability decisions are deferred until the 5k to 10k trend.
+
+## Progress
+
+| Step | PSNR | SSIM | D-RMSE | Dynamic GT | Pred dynamic | FG recall | Status |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 1,000 | 18.7330 | 0.5088 | 11.89 m | near 0 | 0.4% cumulative | 1.7% cumulative | RGB/depth healthy; assignment collapsing |
+
+At about optimizer step 2,369, recent training batches reach about 20.8 PSNR,
+16.9 dynamic-region PSNR, and 6.8-7.6 m depth RMSE. The D50 data stream is
+active: dynamic pixels average about 7.75% and valid bbox count about 31.4.
+However, the clean branch retains public-v1 predicted-token-mean supervision,
+so token-level dynamic GT remains nearly zero and learned assignment approaches
+all background. Earlier D50 anti-collapse results also used the non-paper
+`lidar_anchor` supervision; they are not a sampler-only comparison. Per the run
+gate, the RGB baseline continues unchanged while this dynamic limitation is
+tracked separately.
