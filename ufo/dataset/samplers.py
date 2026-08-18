@@ -13,6 +13,7 @@
 # permissions and limitations under the License.
 
 import itertools
+import json
 from typing import Any, Optional
 
 import torch
@@ -83,6 +84,36 @@ class InfiniteSampler(Sampler):
         while True:
             iterable = range(self._sample_count)
             yield from itertools.islice(iterable, self._start, None, self._step)
+
+
+class DynamicMixtureSampler(Sampler):
+    """Mix audited dynamic-rich windows with the full training scene population."""
+
+    def __init__(self, sample_count, rich_pool_path, rich_ratio, seed):
+        self.sample_count = int(sample_count)
+        self.rich_ratio = float(rich_ratio)
+        self.seed = int(seed)
+        with open(rich_pool_path) as handle:
+            payload = json.load(handle)
+        self.rich_pool = [
+            (int(row["scene_index"]), int(row["start_frame"]))
+            for row in payload["samples"]
+        ]
+        if not self.rich_pool:
+            raise ValueError("dynamic-rich pool is empty")
+
+    def __iter__(self):
+        # Independent rank streams avoid replaying the same rich window on every GPU.
+        rank = distributed.get_global_rank()
+        generator = torch.Generator().manual_seed(self.seed + rank)
+        while True:
+            if torch.rand((), generator=generator).item() < self.rich_ratio:
+                i = torch.randint(len(self.rich_pool), (), generator=generator).item()
+                scene_index, start_frame = self.rich_pool[i]
+                yield (scene_index, start_frame, True)
+            else:
+                scene_index = torch.randint(self.sample_count, (), generator=generator).item()
+                yield (scene_index, -1, False)
 
     def _shuffled_iterator(self):
         """Generate shuffled indices."""

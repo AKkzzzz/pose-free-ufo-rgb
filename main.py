@@ -43,7 +43,7 @@ import ufo.utils.misc as misc
 from ufo.utils.engine import evaluate, evaluate_flow, visualize
 from ufo.dataset.constants import DATASET_DICT
 from ufo.dataset.data_utils import prepare_inputs_and_targets
-from ufo.dataset.samplers import InfiniteSampler, NoPaddingDistributedSampler
+from ufo.dataset.samplers import DynamicMixtureSampler, InfiniteSampler, NoPaddingDistributedSampler
 from ufo.dataset.dataset import UFODataset, UFODatasetEval
 from ufo.utils.logging import MetricLogger, WandbLogger, setup_logging
 from ufo.utils.losses import compute_loss
@@ -295,6 +295,9 @@ def get_args_parser():
     parser.add_argument("--object_assignment_loss_coeff", type=float, default=0.01)
     parser.add_argument("--object_assignment_background_weight", type=float, default=0.1)
     parser.add_argument("--object_soft_target_temperature", type=float, default=0.1)
+    parser.add_argument("--training_sampling_mode", choices=["uniform", "dynamic_mixture"], default="uniform")
+    parser.add_argument("--dynamic_rich_pool", type=str, default=None)
+    parser.add_argument("--dynamic_sampling_ratio", type=float, default=0.0)
     parser.add_argument(
         "--instance_scene_index_manifest",
         type=str,
@@ -576,7 +579,17 @@ def main(args):
         reverse=args.reverse,
         args=args
     )
-    sampler_train = InfiniteSampler(sample_count=len(dataset_train), shuffle=True, seed=seed)
+    if args.training_sampling_mode == "uniform":
+        sampler_train = InfiniteSampler(sample_count=len(dataset_train), shuffle=True, seed=seed)
+    else:
+        if not args.dynamic_rich_pool:
+            raise ValueError("dynamic sampling requires --dynamic_rich_pool")
+        sampler_train = DynamicMixtureSampler(
+            sample_count=len(dataset_train),
+            rich_pool_path=args.dynamic_rich_pool,
+            rich_ratio=args.dynamic_sampling_ratio,
+            seed=seed,
+        )
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train,
         sampler=sampler_train,
@@ -832,14 +845,6 @@ def main(args):
             rgb_and_lpips_loss.set_perceptual_loss(True)
 
         model.train()
-        if (
-            world_size > 1
-            and hasattr(model, "no_sync")
-            and args.gradient_accumulation_steps > 1
-            and not args.sequential_chunk_backward
-        ):
-            raise ValueError("DDP accumulation currently requires --sequential_chunk_backward")
-
         with torch.autocast("cuda", dtype=torch.bfloat16):
             # Forward pass and loss computation
             loss_total = 0

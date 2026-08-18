@@ -479,6 +479,11 @@ class UFODataset(Dataset):
             self, index: int, context_frame_idx: int = -1, return_all=False
         ):
         if True:
+            sampling_dynamic_rich = False
+            if isinstance(index, (tuple, list)):
+                index, sampled_start, sampling_dynamic_rich = index
+                if int(sampled_start) >= 0:
+                    context_frame_idx = int(sampled_start)
             N = self.num_target_chunks
             scene_json = self._with_instances(self.annotations[index % len(self.annotations)])
             scene_id = scene_json["scene_id"]
@@ -708,6 +713,7 @@ class UFODataset(Dataset):
                 }
                 sample["sample_start_frame"] = int(initial_start_frame)
                 sample["sample_scene_index"] = int(index % len(self.annotations))
+                sample["sampling_dynamic_rich"] = bool(sampling_dynamic_rich)
                 value_list.append(to_float_tensor(sample))
             
             # get gs frames
