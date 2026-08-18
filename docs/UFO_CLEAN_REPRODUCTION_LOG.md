@@ -30,7 +30,7 @@
 | Optimizer step | PSNR | SSIM | D-RMSE (m) | Delta PSNR to paper | Trend / gate |
 |---:|---:|---:|---:|---:|---|
 | 0 | 10.1248 | 0.3270 | 172.87 | -17.1352 | random initialization |
-| 1,000 | pending | pending | pending | pending | health check only |
+| 1,000 | 18.6629 | 0.5019 | 12.61 | -8.5971 | healthy RGB/depth recovery |
 | 3,000 | pending | pending | pending | pending | health check only |
 | 5,000 | pending | pending | pending | pending | warmup boundary |
 | 7,500 | pending | pending | pending | pending | trend |
@@ -46,3 +46,9 @@ scene-name instance manifest.
 Gate: if 5k to 10k PSNR is still rising materially, continue to 25k without
 structural changes. Only a clear plateau far below the paper result reopens the
 technical-review findings.
+
+At optimizer step 2175, the run remains finite and reaches about 20-21 dB on
+recent training batches. The uniform baseline's object assignment has collapsed
+to background (`pred_dynamic_ratio=0`, foreground recall 0). This is recorded as
+the expected uniform-exposure risk; it is not used to alter the main baseline
+before the scheduled 3k/5k gates.
