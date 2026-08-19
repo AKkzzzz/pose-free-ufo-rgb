@@ -83,4 +83,4 @@ def val(args, model, dataset, log_writer=None, output_prefix=None):
     logger.info(f"[val] Scene metrics: {metrics_all}")
     if log_writer is not None:
         log_writer.update({f"val_ar/{k}": v for k, v in metrics_all.items()})
-
+    return metrics_all

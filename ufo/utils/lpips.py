@@ -37,8 +37,10 @@ def md5_hash(path):
 
 def get_ckpt_path(name, root, check=False):
     assert name in URL_MAP
-    path = os.path.join(root, CKPT_MAP[name])
+    path = os.environ.get("UFO_LPIPS_CKPT", os.path.join(root, CKPT_MAP[name]))
     if not os.path.exists(path) or (check and not md5_hash(path) == MD5_MAP[name]):
+        if os.environ.get("UFO_OFFLINE") == "1":
+            raise FileNotFoundError(f"Offline LPIPS checkpoint missing or invalid: {path}")
         print("Downloading {} model from {} to {}".format(name, URL_MAP[name], path))
         download(URL_MAP[name], path)
         md5 = md5_hash(path)
@@ -126,7 +128,18 @@ class NetLinLayer(nn.Module):
 class vgg16(torch.nn.Module):
     def __init__(self, requires_grad=False, pretrained=True):
         super(vgg16, self).__init__()
-        vgg_pretrained_features = models.vgg16(pretrained=pretrained).features
+        local_weights = os.environ.get("UFO_VGG16_WEIGHTS")
+        if pretrained and local_weights:
+            if not os.path.exists(local_weights):
+                raise FileNotFoundError(f"Offline VGG16 weights missing: {local_weights}")
+            backbone = models.vgg16(weights=None)
+            backbone.load_state_dict(torch.load(local_weights, map_location="cpu", weights_only=True))
+        elif pretrained and os.environ.get("UFO_OFFLINE") == "1":
+            raise RuntimeError("UFO_OFFLINE=1 requires UFO_VGG16_WEIGHTS")
+        else:
+            weights = models.VGG16_Weights.IMAGENET1K_V1 if pretrained else None
+            backbone = models.vgg16(weights=weights)
+        vgg_pretrained_features = backbone.features
         self.slice1 = torch.nn.Sequential()
         self.slice2 = torch.nn.Sequential()
         self.slice3 = torch.nn.Sequential()

@@ -36,7 +36,7 @@
 | 7,500 | pending | pending | pending | pending | trend |
 | 10,000 | pending | pending | pending | pending | first capability gate |
 
-Launch state: running on the only available RTX 4090 (PID `1010217`). The exact
+Launch state: the exact
 EB8 random-initialization smoke passed with finite loss and nonzero Transformer,
 Gaussian, bbox, and affine gradients. Steady-state training is about 1.9-2.1
 seconds per microbatch with about 21 GB peak GPU memory. The run manifest records

@@ -2,7 +2,6 @@
 
 ## Run
 
-- Host: `yx-ufo-8ka--b3013d38a94d-gwvdw7nhic`
 - Hardware: 8 x NVIDIA RTX 4090, 49,140 MiB each (the host does not expose H200)
 - Code commit: `306756a`
 - Train split: official Waymo `798` scenes

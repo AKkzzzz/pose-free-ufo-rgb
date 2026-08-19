@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -278,6 +279,10 @@ def get_args_parser():
                         help="Backward each detached recurrent chunk immediately, then take one optimizer step.")
     parser.add_argument("--gradient_accumulation_steps", default=1, type=int,
                         help="Dataloader microbatches per optimizer step; independent of recurrent chunks.")
+    parser.add_argument("--ddp_accumulation_no_sync", action="store_true",
+                        help="Synchronize DDP gradients only on the final accumulation microbatch.")
+    parser.add_argument("--ddp_smoke_assertions", action="store_true",
+                        help="Assert distinct rank data and synchronized gradients/parameters once.")
     parser.add_argument("--detach_scene_between_chunks", action="store_true",
                         help="Detach all recurrent scene tensors between chunks (truncated recurrent gradients).")
     parser.add_argument("--allow_old_scene_grad", action="store_true",
@@ -295,6 +300,12 @@ def get_args_parser():
     parser.add_argument("--object_assignment_loss_coeff", type=float, default=0.01)
     parser.add_argument("--object_assignment_background_weight", type=float, default=0.1)
     parser.add_argument("--object_soft_target_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--object_assignment_gt_mode",
+        choices=["predicted_mean", "lidar_anchor"],
+        default="predicted_mean",
+        help="Public-v1 predicted mean or reproduction-decision LiDAR token anchor supervision.",
+    )
     parser.add_argument("--training_sampling_mode", choices=["uniform", "dynamic_mixture"], default="uniform")
     parser.add_argument("--dynamic_rich_pool", type=str, default=None)
     parser.add_argument("--dynamic_sampling_ratio", type=float, default=0.0)
@@ -328,6 +339,8 @@ def get_args_parser():
                         help="Sprint-only override; logs missing flow/mask components without claiming contract equivalence.")
 
     parser.add_argument("--start_iteration", default=0, type=int, help="start iteration")
+    parser.add_argument("--best_validation_psnr", default=-1.0, type=float,
+                        help="Best held-out gate PSNR persisted in checkpoints.")
     parser.add_argument("--num_iterations", default=200_000, type=int, help="num of iterations")
     parser.add_argument("--resume_from", default=None, help="resume from checkpoint")
     parser.add_argument("--auto_resume", action="store_true")
@@ -443,11 +456,25 @@ def save_run_manifest(args, world_size, train_annotation, val_annotation):
         "validation_scene_list": val_annotation,
         "instance_scene_manifest": args.instance_scene_index_manifest,
     }
+    git_diff = subprocess.check_output(["git", "diff", "--binary"], text=False)
     manifest = {
         "command": [sys.executable, *sys.argv],
         "git_commit": git("rev-parse", "HEAD"),
         "git_status": git("status", "--short"),
         "git_diff_stat": git("diff", "--stat"),
+        "git_diff_sha256": hashlib.sha256(git_diff).hexdigest(),
+        "hostname": os.uname().nodename,
+        "container_id": os.environ.get("HOSTNAME"),
+        "runtime": {
+            "python": sys.version,
+            "pytorch": torch.__version__,
+            "torch_cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "nccl": torch.cuda.nccl.version() if torch.cuda.is_available() else None,
+            "torch_cuda_arch_list": os.environ.get("TORCH_CUDA_ARCH_LIST"),
+            "gpu_names": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+            "gpu_capabilities": [torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())],
+        },
         "seed": args.seed,
         "resolved_config": vars(args),
         "training_scale": {
@@ -757,6 +784,10 @@ def main(args):
     logger.info(f"Original start Iteration: {args.start_iteration}")
     vis_slice_id = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
     logger.info(f"New start iteration {args.start_iteration}")
+    sampler_advance = args.start_iteration * args.gradient_accumulation_steps * args.batch_size
+    if hasattr(sampler_train, "set_advance"):
+        sampler_train.set_advance(sampler_advance)
+        logger.info("Advanced rank-local sampler stream by %d samples", sampler_advance)
 
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"{args.model} Trainable Parameters: {num_trainable_params / 1e6:.2f}M")
@@ -817,6 +848,72 @@ def main(args):
     metrics_file = os.path.join(args.log_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
     start_time = time.time()
+    termination = {"signal": None}
+    ddp_smoke_state = {"data_checked": False, "gradient_checked": False, "parameter_checked": False}
+
+    def representative_tensor_checksum(tensor):
+        flat = tensor.detach().float().reshape(-1)
+        sample = flat[: min(flat.numel(), 4096)]
+        weights = torch.linspace(1.0, 2.0, sample.numel(), device=sample.device)
+        return torch.stack((sample.sum(), (sample * weights).sum(), sample.square().sum()))
+
+    def assert_all_ranks_close(value, label):
+        gathered = [torch.empty_like(value) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, value)
+        reference = gathered[0]
+        for rank, candidate in enumerate(gathered[1:], start=1):
+            if not torch.allclose(reference, candidate, rtol=1e-5, atol=1e-6):
+                raise RuntimeError(f"DDP smoke {label} mismatch between rank0 and rank{rank}")
+
+    def batch_fingerprint(batch):
+        first = batch[0] if isinstance(batch, (list, tuple)) else batch
+        scene_names = first.get("scene_name", [])
+        starts = first.get("sample_start_frame", [])
+        if torch.is_tensor(starts):
+            starts = starts.detach().cpu().tolist()
+        return repr((scene_names, starts))
+
+    def request_emergency_checkpoint(signum, _frame):
+        termination["signal"] = int(signum)
+
+    signal.signal(signal.SIGTERM, request_emergency_checkpoint)
+    signal.signal(signal.SIGINT, request_emergency_checkpoint)
+
+    def save_training_checkpoint(step, filename):
+        local_rng_state = misc.capture_rng_state()
+        rng_states = [None for _ in range(world_size)]
+        if world_size > 1:
+            torch.distributed.all_gather_object(rng_states, local_rng_state)
+        else:
+            rng_states[0] = local_rng_state
+        if distributed.is_main_process():
+            elapsed_t = time.time() - start_time + args.total_elapsed_time
+            checkpoint = {
+                "model": model_without_ddp.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "loss_scaler": loss_scaler.state_dict(),
+                "latest_step": step,
+                "vis_slice_id": vis_slice_id,
+                "args": args,
+                "total_elapsed_time": elapsed_t,
+                "rng_states": rng_states,
+                "sampler_advance_per_rank": (step + 1) * args.gradient_accumulation_steps * args.batch_size,
+                "scheduler_state": {
+                    "type": args.lr_sched,
+                    "warmup_iters": args.warmup_iters,
+                    "optimizer_step": step + 1,
+                },
+                "perceptual_loss_active": bool(
+                    args.enable_perceptual_loss and step + 1 >= args.perceptual_loss_start_iter
+                ),
+                "best_validation_psnr": args.best_validation_psnr,
+            }
+            checkpoint_path = os.path.join(args.ckpt_dir, filename)
+            torch.save(checkpoint, checkpoint_path)
+            misc.cleanup_checkpoints(args.ckpt_dir, keep_num=args.keep_n_ckpts)
+            logger.info("Saved checkpoint to %s", checkpoint_path)
+        if world_size > 1:
+            torch.distributed.barrier()
     num_tokens_printed = False
     micro_step = args.start_iteration * args.gradient_accumulation_steps
     validation_steps = {
@@ -833,6 +930,14 @@ def main(args):
             break
         accumulation_index = micro_step % args.gradient_accumulation_steps
         should_step = accumulation_index == args.gradient_accumulation_steps - 1
+        if args.ddp_smoke_assertions and world_size > 1 and not ddp_smoke_state["data_checked"]:
+            local_fingerprint = batch_fingerprint(data_dict)
+            fingerprints = [None for _ in range(world_size)]
+            torch.distributed.all_gather_object(fingerprints, local_fingerprint)
+            if len(set(fingerprints)) == 1:
+                raise RuntimeError(f"DDP smoke ranks consumed identical data: {fingerprints[0]}")
+            ddp_smoke_state["data_checked"] = True
+            logger.info("DDP smoke distinct rank data PASS: %s", fingerprints)
         if accumulation_index == 0:
             optimizer.zero_grad()
             accumulation_loss_dict = {}
@@ -845,6 +950,17 @@ def main(args):
             rgb_and_lpips_loss.set_perceptual_loss(True)
 
         model.train()
+        accumulation_sync_context = (
+            model.no_sync()
+            if (
+                args.ddp_accumulation_no_sync
+                and world_size > 1
+                and hasattr(model, "no_sync")
+                and not should_step
+            )
+            else contextlib.nullcontext()
+        )
+        accumulation_sync_context.__enter__()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             # Forward pass and loss computation
             loss_total = 0
@@ -969,16 +1085,39 @@ def main(args):
 
         if not args.sequential_chunk_backward:
             loss_scaler.backward(loss_total / args.gradient_accumulation_steps)
+        accumulation_sync_context.__exit__(None, None, None)
 
         micro_step += 1
         if not should_step:
             continue
+
+        if args.ddp_smoke_assertions and world_size > 1 and not ddp_smoke_state["gradient_checked"]:
+            gradient = next((parameter.grad for parameter in model.parameters() if parameter.grad is not None), None)
+            if gradient is None:
+                raise RuntimeError("DDP smoke found no gradient before optimizer step")
+            assert_all_ranks_close(representative_tensor_checksum(gradient), "gradient")
+            ddp_smoke_state["gradient_checked"] = True
+            logger.info("DDP smoke gradient all-reduce PASS")
 
         grad_norm = loss_scaler.step(
             optimizer, parameters=model.parameters(), clip_grad=args.grad_clip
         )
         grad_group_norms = parameter_grad_norms(model_without_ddp)
         optimizer.zero_grad()
+        if args.ddp_smoke_assertions and world_size > 1 and not ddp_smoke_state["parameter_checked"]:
+            parameter = next(model.parameters())
+            assert_all_ranks_close(representative_tensor_checksum(parameter), "parameter")
+            ddp_smoke_state["parameter_checked"] = True
+            if distributed.is_main_process():
+                status_path = os.path.join(args.log_dir, "ddp_smoke_status.json")
+                with open(status_path, "w") as handle:
+                    json.dump({
+                        "distinct_rank_data": True,
+                        "gradient_all_reduce": True,
+                        "parameters_synchronized": True,
+                        "single_logical_checkpoint_writer": "rank0",
+                    }, handle, indent=2, sort_keys=True)
+            logger.info("DDP smoke synchronized parameters PASS")
         torch.cuda.synchronize()
         loss_dict = {
             key: value / args.gradient_accumulation_steps
@@ -1028,31 +1167,40 @@ def main(args):
                 log_writer.flush()
 
         if (data_iter_step + 1) % args.ckpt_every_n_iters == 0:
-            if distributed.is_main_process():
-                elapsed_t = time.time() - start_time + args.total_elapsed_time
-                checkpoint = {
-                    "model": model_without_ddp.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "loss_scaler": loss_scaler.state_dict(),
-                    "latest_step": data_iter_step,
-                    "vis_slice_id": vis_slice_id,
-                    "args": args,
-                    "total_elapsed_time": elapsed_t,
-                }
-                checkpoint_path = os.path.join(args.ckpt_dir, f"ckpt_{data_iter_step:06d}.pth")
-                torch.save(checkpoint, checkpoint_path)
-                misc.cleanup_checkpoints(args.ckpt_dir, keep_num=args.keep_n_ckpts)
-                logger.info(f"Saved checkpoint to {checkpoint_path}")
-
-            torch.distributed.barrier()
+            save_training_checkpoint(data_iter_step, f"ckpt_{data_iter_step:06d}.pth")
             torch.cuda.empty_cache()
+
+        termination_flag = torch.tensor(
+            int(termination["signal"] is not None), device=device, dtype=torch.int32
+        )
+        if world_size > 1:
+            torch.distributed.all_reduce(termination_flag, op=torch.distributed.ReduceOp.MAX)
+        if termination_flag.item():
+            save_training_checkpoint(data_iter_step, f"emergency_{data_iter_step:06d}.pth")
+            logger.warning("Emergency checkpoint completed after termination request")
+            return
 
         completed_step = data_iter_step + 1
         if (
             completed_step in validation_steps
             or (args.vis_every_n_iters > 0 and completed_step % args.vis_every_n_iters == 0)
         ):
-            val(args, model_without_ddp, dataset_val, log_writer=log_writer, output_prefix=os.path.join(args.log_dir, "videos", f"{data_iter_step:07d}"))
+            validation_metrics = val(
+                args,
+                model_without_ddp,
+                dataset_val,
+                log_writer=log_writer,
+                output_prefix=os.path.join(args.log_dir, "videos", f"{data_iter_step:07d}"),
+            )
+            validation_psnr = float(validation_metrics["psnr"])
+            if validation_psnr > args.best_validation_psnr:
+                args.best_validation_psnr = validation_psnr
+                save_training_checkpoint(data_iter_step, "best.pth")
+                logger.info(
+                    "New validation-best checkpoint: step=%d psnr=%.4f",
+                    completed_step,
+                    validation_psnr,
+                )
 
         data_iter_step += 1
 

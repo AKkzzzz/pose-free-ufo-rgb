@@ -225,6 +225,25 @@ def cleanup_checkpoints(ckpt_dir, keep_num=1):
         logger.info(f"Created symlink: {latest_symlink} -> {ckpts[-1]}")
 
 
+def capture_rng_state():
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(state):
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
 def load_model(args, model_without_ddp, optimizer=None, loss_scaler=None):
     """
     Load model, optimizer, and loss scaler states from a checkpoint.
@@ -271,6 +290,14 @@ def load_model(args, model_without_ddp, optimizer=None, loss_scaler=None):
                 args.total_elapsed_time = float(checkpoint["total_elapsed_time"])
                 elapsed_time_str = str(datetime.timedelta(seconds=int(args.total_elapsed_time)))
                 logger.info(f"Loaded elapsed_time: {elapsed_time_str}")
+            if "best_validation_psnr" in checkpoint:
+                args.best_validation_psnr = float(checkpoint["best_validation_psnr"])
+                logger.info("Restored best validation PSNR: %.4f", args.best_validation_psnr)
+            rng_states = checkpoint.get("rng_states")
+            if rng_states:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                restore_rng_state(rng_states[min(rank, len(rng_states) - 1)])
+                logger.info("Restored RNG state for rank %d", rank)
             del checkpoint
 
     if not checkpoint_loaded and args.load_from and os.path.exists(args.load_from):

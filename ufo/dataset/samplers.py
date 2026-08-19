@@ -73,6 +73,9 @@ class InfiniteSampler(Sampler):
         self._step = distributed.get_world_size() if step is None else step
         self._advance = advance
 
+    def set_advance(self, advance: int):
+        self._advance = int(advance)
+
     def __iter__(self):
         """Yield indices based on the specified configuration."""
         iterator = self._shuffled_iterator() if self._shuffle else self._iterator()
@@ -85,14 +88,23 @@ class InfiniteSampler(Sampler):
             iterable = range(self._sample_count)
             yield from itertools.islice(iterable, self._start, None, self._step)
 
+    def _shuffled_iterator(self):
+        """Generate deterministically shuffled, rank-sharded indices."""
+        assert self._shuffle
+        generator = torch.Generator().manual_seed(self._seed)
+        while True:
+            iterable = _generate_randperm_indices(size=self._sample_count, generator=generator)
+            yield from itertools.islice(iterable, self._start, None, self._step)
+
 
 class DynamicMixtureSampler(Sampler):
     """Mix audited dynamic-rich windows with the full training scene population."""
 
-    def __init__(self, sample_count, rich_pool_path, rich_ratio, seed):
+    def __init__(self, sample_count, rich_pool_path, rich_ratio, seed, advance=0):
         self.sample_count = int(sample_count)
         self.rich_ratio = float(rich_ratio)
         self.seed = int(seed)
+        self.advance = int(advance)
         with open(rich_pool_path) as handle:
             payload = json.load(handle)
         self.rich_pool = [
@@ -106,22 +118,19 @@ class DynamicMixtureSampler(Sampler):
         # Independent rank streams avoid replaying the same rich window on every GPU.
         rank = distributed.get_global_rank()
         generator = torch.Generator().manual_seed(self.seed + rank)
-        while True:
-            if torch.rand((), generator=generator).item() < self.rich_ratio:
-                i = torch.randint(len(self.rich_pool), (), generator=generator).item()
-                scene_index, start_frame = self.rich_pool[i]
-                yield (scene_index, start_frame, True)
-            else:
-                scene_index = torch.randint(self.sample_count, (), generator=generator).item()
-                yield (scene_index, -1, False)
+        def stream():
+            while True:
+                if torch.rand((), generator=generator).item() < self.rich_ratio:
+                    i = torch.randint(len(self.rich_pool), (), generator=generator).item()
+                    scene_index, start_frame = self.rich_pool[i]
+                    yield (scene_index, start_frame, True)
+                else:
+                    scene_index = torch.randint(self.sample_count, (), generator=generator).item()
+                    yield (scene_index, -1, False)
+        yield from itertools.islice(stream(), self.advance, None)
 
-    def _shuffled_iterator(self):
-        """Generate shuffled indices."""
-        assert self._shuffle
-        generator = torch.Generator().manual_seed(self._seed)
-        while True:
-            iterable = _generate_randperm_indices(size=self._sample_count, generator=generator)
-            yield from itertools.islice(iterable, self._start, None, self._step)
+    def set_advance(self, advance: int):
+        self.advance = int(advance)
 
 
 class NoPaddingDistributedSampler(Sampler):

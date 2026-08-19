@@ -1196,6 +1196,23 @@ class UFO(ViT):
             t=t,
             v=v,
         )
+        if self.args.object_assignment_gt_mode == "lidar_anchor":
+            if 'context_depth' not in data_dict:
+                raise RuntimeError("lidar_anchor assignment requires context_depth")
+            depth = data_dict['context_depth'].to(data_dict['gs_dirs'].dtype)
+            valid = torch.isfinite(depth) & (depth > 0)
+            points = data_dict['gs_origins'] + data_dict['gs_dirs'] * depth[..., None]
+            flat_points = rearrange(points * valid[..., None], 'b t v h w c -> (b t v) c h w')
+            flat_valid = rearrange(valid.float(), 'b t v h w -> (b t v) 1 h w')
+            point_sum = F.avg_pool2d(flat_points, self.unpatch_size, self.unpatch_size)
+            valid_fraction = F.avg_pool2d(flat_valid, self.unpatch_size, self.unpatch_size)
+            anchor = point_sum / valid_fraction.clamp_min(1.0 / (self.unpatch_size ** 2))
+            data_dict['assignment_anchor_means'] = rearrange(
+                anchor, '(b t v) c ph pw -> b (t v ph pw) c', b=b, t=t, v=v
+            )
+            data_dict['assignment_anchor_valid'] = rearrange(
+                valid_fraction > 0, '(b t v) 1 ph pw -> b (t v ph pw)', b=b, t=t, v=v
+            )
         return data_dict
 
 
@@ -1281,13 +1298,22 @@ class UFO(ViT):
         )
         t_means = rearrange(gs_params["means"], "b t v h w c -> b t (v h w) c")
         token_means = rearrange(data_dict['gs_token_means'], "b (t n) c -> b t n c", t=t)
+        assignment_means = token_means
+        assignment_valid = None
+        if self.args.object_assignment_gt_mode == "lidar_anchor":
+            assignment_means = rearrange(
+                data_dict['assignment_anchor_means'], "b (t n) c -> b t n c", t=t
+            )
+            assignment_valid = rearrange(
+                data_dict['assignment_anchor_valid'], "b (t n) -> b t n", t=t
+            )
 
 
         with torch.no_grad():
             gt_prob = torch.zeros_like(token_probabilities)
             for _t in range(t):
                 gt_prob[:, _t] = points_in_boxes_probability(
-                    token_means[:, _t].detach(),
+                    assignment_means[:, _t].detach(),
                     data_dict['context_instances_corner'][:, _t],
                     data_dict['context_instances_id'][:, _t],
                     temperature=0.01,
@@ -1295,7 +1321,11 @@ class UFO(ViT):
 
         gt_soft_prob = gt_prob
         gt_prob = gt_soft_prob.argmax(dim=-1)
-        loss_mask = torch.ones_like(gt_prob, dtype=torch.bool)
+        loss_mask = (
+            assignment_valid.bool()
+            if assignment_valid is not None
+            else torch.ones_like(gt_prob, dtype=torch.bool)
+        )
         loss_gt_prob = gt_prob[loss_mask]
         loss_pred_porb = token_probabilities[loss_mask]
         loss_pred_logits = token_logits[loss_mask]
