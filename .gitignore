@@ -21,6 +21,7 @@
 *.tar.gz
 *.zip
 /offline_assets/
+/h200_transfer/
 
 # Native/JIT build products
 *.so
