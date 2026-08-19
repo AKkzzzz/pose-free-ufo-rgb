@@ -28,7 +28,5 @@ run_candidate() {
   fi
 }
 
-run_candidate b8_a1 8 1
-run_candidate b4_a2 4 2
-run_candidate b2_a4 2 4
+run_candidate b1_a8 1 8
 "${UFO_PYTHON_BIN}" scripts/h200/select_smoke_result.py "${UFO_OUTPUT_ROOT}"

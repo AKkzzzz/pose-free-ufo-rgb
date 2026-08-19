@@ -7,7 +7,9 @@ import sys
 
 def main():
     output_root = pathlib.Path(sys.argv[1])
-    candidates = [("b8_a1", 8, 1), ("b4_a2", 4, 2), ("b2_a4", 2, 4)]
+    candidates = [
+    ("b1_a8", 1, 8),
+]
     rows = []
     for name, batch, accumulation in candidates:
         run_dir = output_root / "h200_smoke" / name
