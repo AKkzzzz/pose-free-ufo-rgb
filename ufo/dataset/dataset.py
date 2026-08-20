@@ -341,7 +341,9 @@ class UFODataset(Dataset):
             if self.load_depth or self.load_flow:
                 if dataset_name == "waymo":
                     depth_path = img_path.replace("images", "depth_flows").replace("jpg", "npy")
-                    depth_and_flow = np.load(depth_path)
+                    depth_and_flow = np.load(
+                        depth_path, mmap_mode=None if self.load_flow else "r"
+                    )
                     if self.load_depth:
                         depth = depth_and_flow[..., 0]
                         depth = torch.tensor(depth).float()

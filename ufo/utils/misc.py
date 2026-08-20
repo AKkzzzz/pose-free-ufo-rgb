@@ -1155,7 +1155,7 @@ def batched_index_update(
 
 def update_scene(
     input_dict, model, scene=None, export_ply=False, profile=False, render=True,
-    filter_num=3600, log_dir='', detach_old_scene=True,
+    filter_num=3600, log_dir='', detach_old_scene=True, collect_diagnostics=True,
 ):
     """ Update the scene representation with new input frames
 
@@ -1350,9 +1350,13 @@ def update_scene(
         torch.cuda.synchronize()
         start_time = time.perf_counter()
     if scene and len(scene['gs_state']) > 0 and filter_num > 0:
-        old_update_delta = (input_dict['updated_posterior'].detach().float() - input_dict['posterior_gs'].detach().float()).norm(dim=-1)
-        old_update_l2_mean = old_update_delta.mean().item()
-        old_update_l2_max = old_update_delta.max().item()
+        if collect_diagnostics:
+            old_update_delta = (
+                input_dict['updated_posterior'].detach().float()
+                - input_dict['posterior_gs'].detach().float()
+            ).norm(dim=-1)
+            old_update_l2_mean = old_update_delta.mean().item()
+            old_update_l2_max = old_update_delta.max().item()
         if filtering:
             scene['gs_state'] = batched_index_update(
                 scene['gs_state'],
@@ -1447,19 +1451,21 @@ def update_scene(
     if model_args.recurrent_aux_tokens:
         scene['aux_state'] = input_dict['mis_state']
     scene["_chunk_id"] = current_chunk_id
-    xyz = scene["gs_token_means"].detach().float()
-    scene_diagnostics = {
-        "chunk": current_chunk_id,
-        "scene_token_count": int(scene["gs_state"].shape[1]),
-        "visible_token_count": visible_token_count,
-        "visible_ratio": visible_token_count / max(previous_token_count, 1),
-        "new_token_count": int(new_scene["gs_state"].shape[1]),
-        "token_xyz_min_xyz": xyz.amin(dim=(0, 1)).cpu().tolist(),
-        "token_xyz_max_xyz": xyz.amax(dim=(0, 1)).cpu().tolist(),
-        "token_xyz_mean_norm": xyz.norm(dim=-1).mean().item(),
-        "old_token_update_l2_mean": old_update_l2_mean,
-        "old_token_update_l2_max": old_update_l2_max,
-    }
+    scene_diagnostics = {}
+    if collect_diagnostics:
+        xyz = scene["gs_token_means"].detach().float()
+        scene_diagnostics = {
+            "chunk": current_chunk_id,
+            "scene_token_count": int(scene["gs_state"].shape[1]),
+            "visible_token_count": visible_token_count,
+            "visible_ratio": visible_token_count / max(previous_token_count, 1),
+            "new_token_count": int(new_scene["gs_state"].shape[1]),
+            "token_xyz_min_xyz": xyz.amin(dim=(0, 1)).cpu().tolist(),
+            "token_xyz_max_xyz": xyz.amax(dim=(0, 1)).cpu().tolist(),
+            "token_xyz_mean_norm": xyz.norm(dim=-1).mean().item(),
+            "old_token_update_l2_mean": old_update_l2_mean,
+            "old_token_update_l2_max": old_update_l2_max,
+        }
     if profile:
         torch.cuda.synchronize()
         end_time = time.perf_counter()

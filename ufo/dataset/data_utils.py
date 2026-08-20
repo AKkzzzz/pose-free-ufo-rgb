@@ -357,8 +357,9 @@ def prepare_inputs_and_targets(data_dict, device=torch.device("cuda"), v=3, time
         
     input_dict["context_frame_idx"] = data_dict["context"]["frame_idx"]
     target_dict["target_frame_idx"] = data_dict["target"]["frame_idx"]
-    input_dict = {k: v.to(device) for k, v in input_dict.items()}
-    target_dict = {k: v.to(device) for k, v in target_dict.items()}
+    non_blocking = bool(getattr(args, "non_blocking_h2d", False)) if args is not None else False
+    input_dict = {k: v.to(device, non_blocking=non_blocking) for k, v in input_dict.items()}
+    target_dict = {k: v.to(device, non_blocking=non_blocking) for k, v in target_dict.items()}
     input_dict["timespan"] = timespan
     input_dict["scene_id"] = data_dict["scene_id"]
     input_dict["scene_name"] = data_dict["scene_name"]

@@ -48,7 +48,9 @@ from ufo.dataset.samplers import DynamicMixtureSampler, InfiniteSampler, NoPaddi
 from ufo.dataset.dataset import UFODataset, UFODatasetEval
 from ufo.utils.logging import MetricLogger, WandbLogger, setup_logging
 from ufo.utils.losses import compute_loss
-from ufo.utils.diagnostics import gaussian_metrics, parameter_grad_norms, reconstruction_metrics
+from ufo.utils.diagnostics import (
+    assignment_metrics, gaussian_metrics, parameter_grad_norms, reconstruction_metrics,
+)
 from ufo.utils.lpips_loss import RGBLpipsLoss
 from ufo.utils.misc import NativeScalerWithGradNormCount as NativeScaler
 from ufo.utils.misc import combine_dict_entries, project_boxes_to_image, convert_to_chunks
@@ -275,6 +277,13 @@ def get_args_parser():
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--grad_clip", type=float, default=3.0, help="Gradient clip")
     parser.add_argument("--disable_grad_checkpointing", action="store_true")
+    parser.add_argument("--sparse_training_diagnostics", action="store_true")
+    parser.add_argument("--diagnostic_interval", type=int, default=100)
+    parser.add_argument("--gaussian_diagnostic_interval", type=int, default=500)
+    parser.add_argument("--module_grad_norm_interval", type=int, default=500)
+    parser.add_argument("--benchmark_timing_output", default=None)
+    parser.add_argument("--benchmark_warmup_steps", type=int, default=20)
+    parser.add_argument("--equivalence_artifact", default=None)
     parser.add_argument("--sequential_chunk_backward", action="store_true",
                         help="Backward each detached recurrent chunk immediately, then take one optimizer step.")
     parser.add_argument("--gradient_accumulation_steps", default=1, type=int,
@@ -361,6 +370,13 @@ def get_args_parser():
     parser.add_argument("--dataset", default="waymo", type=str, choices=DATASET_DICT.keys())
     parser.add_argument("--subset_ratio", default=1.0, type=float)
     parser.add_argument("--num_workers", default=16, type=int)
+    parser.add_argument("--pin_memory", action="store_true")
+    parser.add_argument("--non_blocking_h2d", action="store_true")
+    parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument(
+        "--disable_train_flow_loading", action="store_true",
+        help="Skip GT flow I/O for training only; evaluation still loads GT flow.",
+    )
     parser.add_argument("--skip_sky_mask", action="store_true", help="skip sky mask loading")
     # ============= Logging ============= #
     parser.add_argument("--output_dir", default="./output")
@@ -598,7 +614,7 @@ def main(args):
         timespan=args.timespan,
         num_max_cams=args.num_max_cameras,
         load_depth=args.load_depth,
-        load_flow=args.load_flow,
+        load_flow=args.load_flow and not args.disable_train_flow_loading,
         load_dynamic_mask=args.load_dynamic_mask,
         skip_sky_mask=args.skip_sky_mask,
         num_target_chunks=args.num_target_chunks,
@@ -617,14 +633,18 @@ def main(args):
             rich_ratio=args.dynamic_sampling_ratio,
             seed=seed,
         )
+    train_loader_options = {}
+    if args.num_workers > 0:
+        train_loader_options["prefetch_factor"] = args.prefetch_factor
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train,
         sampler=sampler_train,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=False,
+        pin_memory=args.pin_memory,
         persistent_workers=True if args.num_workers > 0 else False,
         drop_last=True,
+        **train_loader_options,
     )
 
     if val_annotation is not None:
@@ -850,6 +870,8 @@ def main(args):
     start_time = time.time()
     termination = {"signal": None}
     ddp_smoke_state = {"data_checked": False, "gradient_checked": False, "parameter_checked": False}
+    benchmark_events = {"forward": [], "backward": [], "optimizer": [], "compute_step": []}
+    compute_step_start = None
 
     def representative_tensor_checksum(tensor):
         flat = tensor.detach().float().reshape(-1)
@@ -944,6 +966,17 @@ def main(args):
             accumulation_metric_dict = {}
             accumulation_scene_diagnostics = []
             misc.adjust_learning_rate(optimizer, data_iter_step, args)
+            if args.benchmark_timing_output and data_iter_step >= args.benchmark_warmup_steps:
+                compute_step_start = torch.cuda.Event(enable_timing=True)
+                compute_step_start.record()
+        collect_step_diagnostics = (
+            not args.sparse_training_diagnostics
+            or data_iter_step % args.diagnostic_interval == 0
+        )
+        collect_gaussian_diagnostics = (
+            not args.sparse_training_diagnostics
+            or data_iter_step % args.gaussian_diagnostic_interval == 0
+        )
         if log_writer is not None:
             log_writer.set_step(data_iter_step)
         if args.enable_perceptual_loss and data_iter_step >= args.perceptual_loss_start_iter:
@@ -961,6 +994,14 @@ def main(args):
             else contextlib.nullcontext()
         )
         accumulation_sync_context.__enter__()
+        benchmark_active = (
+            args.benchmark_timing_output
+            and data_iter_step >= args.benchmark_warmup_steps
+        )
+        forward_start = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        forward_end = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        if benchmark_active:
+            forward_start.record()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             # Forward pass and loss computation
             loss_total = 0
@@ -999,6 +1040,7 @@ def main(args):
                         profile=False, render=not final_scene_supervision,
                         filter_num=args.filter_num, log_dir=args.log_dir,
                         detach_old_scene=not args.allow_old_scene_grad,
+                        collect_diagnostics=collect_step_diagnostics,
                     )
                     if final_scene_supervision:
                         final_scene_inputs.append((input_dict, target_dict))
@@ -1008,26 +1050,6 @@ def main(args):
                         loss_dict.update({'class_loss': pred_dict['class_loss']})
                         if 'ray_loss' in pred_dict:
                             loss_dict.update({'ray_loss': pred_dict['ray_loss']})
-                        nonfinite_losses = {
-                            key: value.detach().float().cpu().tolist()
-                            for key, value in loss_dict.items()
-                            if torch.is_tensor(value) and not torch.isfinite(value).all()
-                        }
-                        if nonfinite_losses:
-                            nonfinite_predictions = {
-                                key: tuple(value.shape)
-                                for key, value in pred_dict.items()
-                                if torch.is_tensor(value) and not torch.isfinite(value).all()
-                            }
-                            logger.error(
-                                "Non-finite chunk=%d context_frames=%s target_frames=%s "
-                                "losses=%s predictions=%s",
-                                i,
-                                input_dict.get("frame_idx"),
-                                target_dict.get("frame_idx"),
-                                nonfinite_losses,
-                                nonfinite_predictions,
-                            )
                         loss_value = sum(loss for k, loss in loss_dict.items() if "loss" in k)
                         for key, value in loss_dict.items():
                             loss_dict_accum[key] = loss_dict_accum.get(key, 0.0) + value.detach()
@@ -1039,10 +1061,12 @@ def main(args):
                         else:
                             loss_total += loss_value
 
-                if not final_scene_supervision:
+                if not final_scene_supervision and collect_step_diagnostics:
                     with torch.no_grad():
                         chunk_metrics = reconstruction_metrics(pred_dict, target_dict)
-                        chunk_metrics.update(gaussian_metrics(pred_dict, args.max_gaussian_scale))
+                        chunk_metrics.update(assignment_metrics(pred_dict))
+                        if collect_gaussian_diagnostics:
+                            chunk_metrics.update(gaussian_metrics(pred_dict, args.max_gaussian_scale))
                         for key, value in chunk_metrics.items():
                             accumulation_metric_dict[key] = accumulation_metric_dict.get(key, 0.0) + value
                     accumulation_scene_diagnostics.append(pred_dict.get("scene_diagnostics", {}))
@@ -1069,22 +1093,49 @@ def main(args):
                     loss_total += loss_value
                     for key, value in loss_dict.items():
                         loss_dict_accum[key] = loss_dict_accum.get(key, 0.0) + value.detach()
-                    with torch.no_grad():
-                        chunk_metrics = reconstruction_metrics(pred_dict, target_dict)
-                        chunk_metrics.update(gaussian_metrics(pred_dict, args.max_gaussian_scale))
-                        for key, value in chunk_metrics.items():
-                            accumulation_metric_dict[key] = accumulation_metric_dict.get(key, 0.0) + value
+                    if collect_step_diagnostics:
+                        with torch.no_grad():
+                            chunk_metrics = reconstruction_metrics(pred_dict, target_dict)
+                            chunk_metrics.update(assignment_metrics(pred_dict))
+                            if collect_gaussian_diagnostics:
+                                chunk_metrics.update(gaussian_metrics(pred_dict, args.max_gaussian_scale))
+                            for key, value in chunk_metrics.items():
+                                accumulation_metric_dict[key] = accumulation_metric_dict.get(key, 0.0) + value
 
             loss_dict = {key: value / len(inout_dicts) for key, value in loss_dict_accum.items()}
             for key, value in loss_dict.items():
                 accumulation_loss_dict[key] = accumulation_loss_dict.get(key, 0.0) + value
 
-        if not math.isfinite(loss_total):
-            logger.info("NaN detected")
-            raise AssertionError
+        if benchmark_active:
+            forward_end.record()
+            benchmark_events["forward"].append((forward_start, forward_end))
 
+        if not torch.isfinite(loss_total.detach()).all():
+            nonfinite_losses = {
+                key: value.detach().float().cpu().tolist()
+                for key, value in loss_dict_accum.items()
+                if torch.is_tensor(value) and not torch.isfinite(value).all()
+            }
+            nonfinite_predictions = {
+                key: tuple(value.shape)
+                for key, value in pred_dict.items()
+                if torch.is_tensor(value) and not torch.isfinite(value).all()
+            }
+            logger.error(
+                "Non-finite total loss: losses=%s predictions=%s",
+                nonfinite_losses, nonfinite_predictions,
+            )
+            raise FloatingPointError("non-finite total loss")
+
+        backward_start = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        backward_end = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        if benchmark_active:
+            backward_start.record()
         if not args.sequential_chunk_backward:
             loss_scaler.backward(loss_total / args.gradient_accumulation_steps)
+        if benchmark_active:
+            backward_end.record()
+            benchmark_events["backward"].append((backward_start, backward_end))
         accumulation_sync_context.__exit__(None, None, None)
 
         micro_step += 1
@@ -1099,11 +1150,61 @@ def main(args):
             ddp_smoke_state["gradient_checked"] = True
             logger.info("DDP smoke gradient all-reduce PASS")
 
+        if (
+            args.equivalence_artifact
+            and data_iter_step == args.start_iteration
+            and distributed.is_main_process()
+        ):
+            scale = float(loss_scaler._scaler.get_scale())
+            parameter_names = {
+                id(parameter): name for name, parameter in model_without_ddp.named_parameters()
+            }
+            equivalence_payload = {
+                "losses": {
+                    key: (value / args.gradient_accumulation_steps).detach().float().cpu()
+                    for key, value in accumulation_loss_dict.items()
+                },
+                "gradients": {
+                    name: parameter.grad.detach().float().cpu() / scale
+                    for name, parameter in model_without_ddp.named_parameters()
+                    if parameter.grad is not None
+                },
+                "model_keys": tuple(model_without_ddp.state_dict().keys()),
+                "optimizer_group_names": tuple(
+                    tuple(parameter_names[id(parameter)] for parameter in group["params"])
+                    for group in optimizer.param_groups
+                ),
+            }
+        optimizer_start = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        optimizer_end = torch.cuda.Event(enable_timing=True) if benchmark_active else None
+        if benchmark_active:
+            optimizer_start.record()
         grad_norm = loss_scaler.step(
             optimizer, parameters=model.parameters(), clip_grad=args.grad_clip
         )
-        grad_group_norms = parameter_grad_norms(model_without_ddp)
+        if benchmark_active:
+            optimizer_end.record()
+            benchmark_events["optimizer"].append((optimizer_start, optimizer_end))
+        collect_module_grad_norms = (
+            not args.sparse_training_diagnostics
+            or data_iter_step % args.module_grad_norm_interval == 0
+        )
+        grad_group_norms = (
+            parameter_grad_norms(model_without_ddp) if collect_module_grad_norms else {}
+        )
         optimizer.zero_grad()
+        if (
+            args.equivalence_artifact
+            and data_iter_step == args.start_iteration
+            and distributed.is_main_process()
+        ):
+            equivalence_payload["parameters_after"] = {
+                name: parameter.detach().float().cpu()
+                for name, parameter in model_without_ddp.named_parameters()
+            }
+            artifact_path = Path(args.equivalence_artifact)
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(equivalence_payload, artifact_path)
         if args.ddp_smoke_assertions and world_size > 1 and not ddp_smoke_state["parameter_checked"]:
             parameter = next(model.parameters())
             assert_all_ranks_close(representative_tensor_checksum(parameter), "parameter")
@@ -1118,7 +1219,6 @@ def main(args):
                         "single_logical_checkpoint_writer": "rank0",
                     }, handle, indent=2, sort_keys=True)
             logger.info("DDP smoke synchronized parameters PASS")
-        torch.cuda.synchronize()
         loss_dict = {
             key: value / args.gradient_accumulation_steps
             for key, value in accumulation_loss_dict.items()
@@ -1133,10 +1233,22 @@ def main(args):
         total_loss_reduced = sum(loss for k, loss in loss_dict_reduced.items() if "loss" in k)
         lr = optimizer.param_groups[0]["lr"]
         psnr = -10 * np.log10(loss_dict_reduced["rgb_loss"])
+        if args.sparse_training_diagnostics:
+            current_metric_names = {
+                "lr", "psnr", "loss", "grad_norm", "peak_gpu_mb",
+                *loss_dict_reduced.keys(), *training_diagnostics.keys(), *grad_group_norms.keys(),
+            }
+            for name in list(metric_logger.meters):
+                if name not in current_metric_names:
+                    del metric_logger.meters[name]
         metric_logger.update(lr=lr, psnr=psnr, loss=total_loss_reduced, **loss_dict_reduced)
         metric_logger.update(grad_norm=grad_norm)
         metric_logger.update(peak_gpu_mb=torch.cuda.max_memory_allocated() / (1024 ** 2))
         metric_logger.update(**training_diagnostics, **grad_group_norms)
+        if benchmark_active:
+            compute_step_end = torch.cuda.Event(enable_timing=True)
+            compute_step_end.record()
+            benchmark_events["compute_step"].append((compute_step_start, compute_step_end))
 
         if "num_tokens" in pred_dict and not num_tokens_printed:
             logger.info(f"num_tokens: {pred_dict['num_tokens']}")
@@ -1205,6 +1317,18 @@ def main(args):
         data_iter_step += 1
 
     metric_logger.synchronize_between_processes()
+    if args.benchmark_timing_output:
+        torch.cuda.synchronize()
+        timing = {}
+        for name, pairs in benchmark_events.items():
+            elapsed = [start.elapsed_time(end) / 1000.0 for start, end in pairs]
+            timing[name + "_seconds_mean"] = sum(elapsed) / max(len(elapsed), 1)
+            timing[name + "_samples"] = len(elapsed)
+        timing["peak_vram_mb"] = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        if distributed.is_main_process():
+            timing_path = Path(args.benchmark_timing_output)
+            timing_path.parent.mkdir(parents=True, exist_ok=True)
+            timing_path.write_text(json.dumps(timing, indent=2, sort_keys=True) + "\n")
 
     # ========================================================================
     # Final evaluation

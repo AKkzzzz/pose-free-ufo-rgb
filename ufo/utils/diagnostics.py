@@ -171,6 +171,24 @@ def gaussian_metrics(output_dict, max_scale=None):
     return result
 
 
+def assignment_metrics(output_dict):
+    result = {}
+    for key in (
+        "object_assignment_accuracy", "object_dynamic_assignment_accuracy",
+        "object_dynamic_background_error_ratio", "object_dynamic_gt_ratio",
+        "object_dynamic_gt_count", "object_supervised_token_ratio",
+        "object_foreground_recall", "object_foreground_precision",
+        "object_background_precision", "object_predicted_dynamic_ratio",
+        "object_background_probability", "object_assignment_entropy", "bbox_valid_count",
+        "bbox_pose_mean_translation", "bbox_pose_max_translation",
+        "bbox_pose_mean_rotation_deg", "bbox_pose_max_rotation_deg",
+        "bbox_motion_mean_displacement", "bbox_motion_max_displacement",
+    ):
+        if key in output_dict:
+            result[key] = output_dict[key].detach().float().item()
+    return result
+
+
 def parameter_grad_norms(model):
     groups = {
         "transformer_grad_norm": ("blocks.", "patch_embed", "camera_embed", "time_embed"),
