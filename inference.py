@@ -122,6 +122,15 @@ def get_args_parser():
     return parser
 
 
+def add_missing_config_values(args, config_path):
+    """Retain config-only model and dataset fields absent from this CLI parser."""
+    config = json.loads(Path(config_path).read_text())
+    for key, value in config.items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
+    return args
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -458,6 +467,7 @@ def main():
     # Re-parse with the config file specified
     config_path = args.config
     args = merge_config_and_args(parser, config_path=config_path)
+    args = add_missing_config_values(args, config_path)
 
     device = torch.device(args.device)
     logger.info(f"Config: {config_path}")

@@ -1,6 +1,9 @@
+import json
+from argparse import Namespace
+
 import torch
 
-from inference import concatenate_chunk_targets
+from inference import add_missing_config_values, concatenate_chunk_targets
 
 
 def test_concatenate_chunk_targets_preserves_order():
@@ -28,3 +31,19 @@ def test_concatenate_chunk_targets_preserves_order():
     assert render_input["target_time"].tolist() == [list(range(8))]
     assert targets["target_image"].shape[1] == 8
     assert targets["target_frame_idx"].tolist() == [list(range(1, 9))]
+
+
+def test_add_missing_config_values_preserves_cli_values(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "filter_num": 3600,
+        "paper_affine_transform": True,
+        "paper_frame_protocol": True,
+    }))
+    args = Namespace(filter_num=1234)
+
+    actual = add_missing_config_values(args, config_path)
+
+    assert actual.filter_num == 1234
+    assert actual.paper_affine_transform is True
+    assert actual.paper_frame_protocol is True
