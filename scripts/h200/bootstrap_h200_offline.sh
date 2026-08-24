@@ -47,7 +47,7 @@ fi
 
 test -f "${TORCH_EXTENSIONS_DIR}/gsplat_cuda/gsplat_cuda.so"
 if command -v cuobjdump >/dev/null; then
-  cuobjdump --list-elf "${TORCH_EXTENSIONS_DIR}/gsplat_cuda/gsplat_cuda.so" | grep -q 'sm_90.cubin'
+  cuobjdump --list-elf "${TORCH_EXTENSIONS_DIR}/gsplat_cuda/gsplat_cuda.so" | grep 'sm_90.cubin' >/dev/null
 fi
 if ! "${UFO_PYTHON_BIN}" scripts/h200/gsplat_forward_backward_smoke.py; then
   export TORCH_EXTENSIONS_DIR="${UFO_ROOT}/offline_assets/torch_extensions_h200_native"
