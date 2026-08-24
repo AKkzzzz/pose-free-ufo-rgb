@@ -369,6 +369,11 @@ def get_args_parser():
                         help="Load preprocessed dynamic masks for dynamic-region diagnostics.")
     parser.add_argument("--dataset", default="waymo", type=str, choices=DATASET_DICT.keys())
     parser.add_argument("--subset_ratio", default=1.0, type=float)
+    parser.add_argument(
+        "--train_scene_indices", default=None,
+        help="Comma-separated indices into the training annotation list.",
+    )
+    parser.add_argument("--disable_validation", action="store_true")
     parser.add_argument("--num_workers", default=16, type=int)
     parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--non_blocking_h2d", action="store_true")
@@ -592,6 +597,14 @@ def main(args):
     dataset_meta = DATASET_DICT[args.dataset]
     train_annotation = dataset_meta["annotation_txt_file_train"]
     val_annotation = dataset_meta["annotation_txt_file_val"]
+    train_scene_indices = None
+    if args.train_scene_indices:
+        if isinstance(args.train_scene_indices, str):
+            train_scene_indices = [
+                int(value) for value in args.train_scene_indices.split(",") if value.strip()
+            ]
+        else:
+            train_scene_indices = [int(value) for value in args.train_scene_indices]
     if train_annotation is not None:
         if args.dataset == "nuscenes":
             train_annotation = f"data/dataset_scene_list/nuscenes_train.txt"
@@ -604,10 +617,13 @@ def main(args):
             val_annotation = f"{args.data_root}/{val_annotation}"
         if not os.path.exists(val_annotation):
             val_annotation = None
+    if args.disable_validation:
+        val_annotation = None
 
     dataset_train = UFODataset(
         data_root=args.data_root,
         annotation_txt_file_list=train_annotation,
+        subset_indices=train_scene_indices,
         target_size=args.input_size,
         num_context_timesteps=args.num_context_timesteps,
         num_target_timesteps=args.num_target_timesteps,

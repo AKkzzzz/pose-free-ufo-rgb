@@ -29,6 +29,7 @@ from tqdm import trange
 
 from .constants import DATASET_DICT, DATASETS, MEAN, STD
 from .data_utils import resize_depth, resize_flow, to_float_tensor, to_tensor
+from .pose_override import PoseOverrideStore
 from ufo.paper_contract import split_context_supervision
 
 logger = logging.getLogger("UFO")
@@ -125,6 +126,15 @@ class UFODataset(Dataset):
         self.load_dynamic_mask = load_dynamic_mask
         self.load_ground_label = load_ground_label
         self.skip_sky_mask = skip_sky_mask
+        self.pose_override_mode = getattr(args, "pose_override_mode", "none")
+        pose_override_dir = getattr(args, "pose_override_dir", None)
+        if self.pose_override_mode not in ("none", "context", "all"):
+            raise ValueError(f"invalid pose_override_mode={self.pose_override_mode!r}")
+        if self.pose_override_mode != "none" and not pose_override_dir:
+            raise ValueError("pose_override_dir is required when pose_override_mode is enabled")
+        self.pose_override_store = (
+            PoseOverrideStore(pose_override_dir) if self.pose_override_mode != "none" else None
+        )
         if isinstance(annotation_txt_file_list, str):
             annotation_txt_file_list = [annotation_txt_file_list]
         scene_list = []
@@ -157,6 +167,16 @@ class UFODataset(Dataset):
                 transforms.Normalize(mean=MEAN, std=STD),
             ]
         )
+
+    def _camera_to_world(self, scene_json, camera, frame_idx, role):
+        use_override = self.pose_override_store is not None and (
+            role == "context" or (role == "target" and self.pose_override_mode == "all")
+        )
+        if use_override:
+            return self.pose_override_store.get(
+                scene_json["scene_name"], frame_idx, camera
+            )
+        return np.asarray(scene_json["camera_to_world"][camera][frame_idx], dtype=np.float64)
 
     def __len__(self) -> int:
         return len(self.annotations)
@@ -225,12 +245,12 @@ class UFODataset(Dataset):
         frame_idx: int,
         source_frame_idx: int = -1,
         global_source_frame_idx: int = -1,
-        available_instances = None
+        available_instances = None,
+        pose_role: str = "context",
     ) -> Dict[str, Any]:
         """Retrieve a single frame from the dataset."""
         normalized_intrinsics = scene_json["normalized_intrinsics"]
         dataset_name = scene_json["dataset"]
-        cam_to_world = scene_json["camera_to_world"]
 
         images, depths, sky_masks, flows = [], [], [], []
         camtoworlds, intrinsics = [], []
@@ -246,13 +266,20 @@ class UFODataset(Dataset):
         camera_list = DATASET_DICT[dataset_name]["camera_list"][self.num_max_cams]
         ref_camera_name = DATASET_DICT[dataset_name]["ref_camera"]
 
-        c2w_real_cur_frame = np.array(cam_to_world[ref_camera_name][source_frame_idx])
-        c2w_real_global = np.array(cam_to_world[ref_camera_name][global_source_frame_idx])
+        c2w_real_cur_frame = self._camera_to_world(
+            scene_json, ref_camera_name, source_frame_idx, "context"
+        )
+        c2w_real_global = self._camera_to_world(
+            scene_json, ref_camera_name, global_source_frame_idx, "global"
+        )
 
         world_to_canonical = np.linalg.inv(c2w_real_cur_frame)
         world_to_canonical_global = np.linalg.inv(c2w_real_global)
 
         for camera in camera_list:
+            frame_camera_to_world = self._camera_to_world(
+                scene_json, camera, frame_idx, pose_role
+            )
             img_relative_path = scene_json["relative_image_path"][camera][frame_idx]
             if dataset_name in ["waymo", "nuscenes", "argoverse2", "argoverse"]:
                 img_relative_path = img_relative_path.replace("images", f"images_4")
@@ -306,7 +333,7 @@ class UFODataset(Dataset):
             camtoworld = (
                 DATASETS[dataset_name]["canonical_to_flu"]
                 @ world_to_canonical
-                @ cam_to_world[camera][frame_idx]
+                @ frame_camera_to_world
                 @ DATASETS[dataset_name]["opencv2dataset"]
             )
 
@@ -316,7 +343,7 @@ class UFODataset(Dataset):
             camtoworld_global = (
                 DATASETS[dataset_name]["canonical_to_flu"]
                 @ world_to_canonical_global
-                @ cam_to_world[camera][frame_idx]
+                @ frame_camera_to_world
                 @ DATASETS[dataset_name]['opencv2dataset']
             )
             camtoworld_global = to_tensor(camtoworld_global)
@@ -359,7 +386,7 @@ class UFODataset(Dataset):
                             @ torch.tensor(
                                 (
                                     world_to_canonical
-                                    @ cam_to_world[camera][frame_idx]
+                                    @ frame_camera_to_world
                                     @ np.linalg.inv(scene_json["camera_to_ego"][camera])
                                 )
                             )
@@ -658,7 +685,8 @@ class UFODataset(Dataset):
                         frame_idx=ctx_id,
                         source_frame_idx=window_context_indices[0],
                         global_source_frame_idx=last_frame_idx,
-                        available_instances=available_instances
+                        available_instances=available_instances,
+                        pose_role="context",
                     )
                     if self.static:
                         if context_dict['flow'].abs().mean() - 0 > 1e-5:
@@ -680,7 +708,8 @@ class UFODataset(Dataset):
                         frame_idx=target_id,
                         source_frame_idx=window_context_indices[0],
                         global_source_frame_idx=last_frame_idx,
-                        available_instances=available_instances
+                        available_instances=available_instances,
+                        pose_role="target",
                     )
                     target_dict["time"] = torch.tensor(
                         [time_in_seconds[target_id] - time_in_seconds[last_frame_idx]]

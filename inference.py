@@ -78,6 +78,12 @@ def get_args_parser():
                         help="Enable debug mode: save filtering PCD point clouds")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device for inference")
+    parser.add_argument("--annotation_file", type=str, default=None,
+                        help="Explicit annotation list; defaults to the dataset validation list")
+    parser.add_argument("--pose_override_dir", type=str, default=None,
+                        help="Root containing <scene_name>/omega_pose_override.npz")
+    parser.add_argument("--pose_override_mode", choices=("none", "context", "all"),
+                        default="none")
 
     # Model parameters (defaults from config.json, CLI overrides)
     parser.add_argument("--model", default="UFO-B/8", type=str)
@@ -156,8 +162,8 @@ def build_model(args, device):
 def build_dataset(args):
     """Create evaluation dataset."""
     dataset_meta = DATASET_DICT[args.dataset]
-    val_annotation = dataset_meta["annotation_txt_file_val"]
-    if val_annotation is not None:
+    val_annotation = args.annotation_file or dataset_meta["annotation_txt_file_val"]
+    if val_annotation is not None and not args.annotation_file:
         val_annotation = f"{args.data_root}/{val_annotation}"
         if not os.path.exists(val_annotation):
             raise FileNotFoundError(f"Annotation file not found: {val_annotation}")
@@ -165,6 +171,7 @@ def build_dataset(args):
     dataset = UFODataset(
         data_root=args.data_root,
         annotation_txt_file_list=val_annotation,
+        subset_indices=[args.scene_id] if args.annotation_file else None,
         target_size=args.input_size,
         equispaced=True,
         num_context_timesteps=args.num_context_timesteps,
@@ -197,7 +204,8 @@ def run_inference(model, dataset, args, device):
         input_dict: input data for the last chunk (with accumulated scene)
         data_dict: raw data dict (contains fps, scene_name, etc.)
     """
-    data_dict = dataset.__getitem__(args.scene_id, args.start_idx, return_all=True)
+    dataset_index = 0 if args.annotation_file else args.scene_id
+    data_dict = dataset.__getitem__(dataset_index, args.start_idx, return_all=True)
     data_dict = to_batch_tensor(data_dict)
 
     inout_dicts = prepare_inputs_and_targets(
