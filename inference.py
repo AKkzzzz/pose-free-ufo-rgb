@@ -131,12 +131,26 @@ def add_missing_config_values(args, config_path):
     return args
 
 
+def add_missing_checkpoint_values(args, checkpoint):
+    """Fill parser gaps from the exact Namespace persisted during training."""
+    checkpoint_args = checkpoint.get("args")
+    if checkpoint_args is None:
+        return args
+    values = vars(checkpoint_args) if hasattr(checkpoint_args, "__dict__") else checkpoint_args
+    for key, value in values.items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
+    return args
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
 def build_model(args, device):
     """Create and load a UFO model from checkpoint."""
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    add_missing_checkpoint_values(args, checkpoint)
     model = UFO_models[args.model](
         img_size=args.input_size,
         gs_dim=args.gs_dim,
@@ -151,7 +165,6 @@ def build_model(args, device):
         args=args,
     )
 
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     state_dict = checkpoint["model"]
     msg = model.load_state_dict(state_dict, strict=False)
     if msg.missing_keys:

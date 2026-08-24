@@ -3,7 +3,11 @@ from argparse import Namespace
 
 import torch
 
-from inference import add_missing_config_values, concatenate_chunk_targets
+from inference import (
+    add_missing_checkpoint_values,
+    add_missing_config_values,
+    concatenate_chunk_targets,
+)
 
 
 def test_concatenate_chunk_targets_preserves_order():
@@ -47,3 +51,15 @@ def test_add_missing_config_values_preserves_cli_values(tmp_path):
     assert actual.filter_num == 1234
     assert actual.paper_affine_transform is True
     assert actual.paper_frame_protocol is True
+
+
+def test_add_missing_checkpoint_values_preserves_existing_values():
+    args = Namespace(filter_num=1234)
+    checkpoint = {
+        "args": Namespace(filter_num=3600, object_assignment_gt_mode="predicted_mean")
+    }
+
+    actual = add_missing_checkpoint_values(args, checkpoint)
+
+    assert actual.filter_num == 1234
+    assert actual.object_assignment_gt_mode == "predicted_mean"
