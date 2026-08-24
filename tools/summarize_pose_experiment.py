@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 
@@ -11,6 +12,16 @@ RUNS = {
     "E1": "e1_omega_context",
     "E2": "e2_omega_all",
 }
+
+
+def normalize_nonfinite(value):
+    if isinstance(value, dict):
+        return {key: normalize_nonfinite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [normalize_nonfinite(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def parse_args():
@@ -42,8 +53,9 @@ def main():
         "experiments": summary,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result, indent=2))
+    result = normalize_nonfinite(result)
+    args.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
+    print(json.dumps(result, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

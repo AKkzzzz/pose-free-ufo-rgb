@@ -202,6 +202,8 @@ def build_dataset(args):
         num_max_cams=args.num_max_cameras,
         load_depth=args.load_depth,
         load_flow=args.load_flow,
+        load_dynamic_mask=getattr(args, "load_dynamic_mask", False),
+        load_ground_label=getattr(args, "load_ground", False),
         skip_sky_mask=args.skip_sky_mask,
         num_target_chunks=args.num_target_chunks,
         static=args.static,
