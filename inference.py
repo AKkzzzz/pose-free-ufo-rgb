@@ -194,6 +194,25 @@ def build_dataset(args):
 # Inference
 # ---------------------------------------------------------------------------
 
+def concatenate_chunk_targets(inout_dicts):
+    """Combine every chunk's render inputs and GT along the target-time axis."""
+    if not inout_dicts:
+        raise ValueError("cannot concatenate targets from an empty chunk list")
+    render_input = inout_dicts[-1][0].copy()
+    target_keys = [
+        key for key in render_input
+        if key.startswith("target_") and isinstance(render_input[key], torch.Tensor)
+    ]
+    for key in target_keys:
+        values = [input_dict[key] for input_dict, _ in inout_dicts]
+        render_input[key] = torch.cat(values, dim=1)
+
+    target_dict = {}
+    for key in inout_dicts[0][1]:
+        values = [chunk_target[key] for _, chunk_target in inout_dicts]
+        target_dict[key] = torch.cat(values, dim=1)
+    return render_input, target_dict
+
 @torch.no_grad()
 def run_inference(model, dataset, args, device):
     """Run autoregressive inference on a single scene.
@@ -216,11 +235,8 @@ def run_inference(model, dataset, args, device):
 
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         scene = {}
-        target_dict_list = []
-
         for i in range(num_chunks):
             input_dict, target_dict = inout_dicts[i]
-            target_dict_list.append(target_dict)
 
             t0 = time.perf_counter()
             log_dir = ""
@@ -236,8 +252,12 @@ def run_inference(model, dataset, args, device):
             n_tokens = scene["gs_state"].shape[1] if "gs_state" in scene else 0
             logger.info(f"  Chunk {i + 1}/{num_chunks}: {n_tokens} tokens ({elapsed:.3f}s)")
 
-        # Final rendering with accumulated scene
-        logger.info("Rendering final scene...")
+        # Render all target frames against the final accumulated scene.
+        input_dict, target_dict = concatenate_chunk_targets(inout_dicts)
+        logger.info(
+            "Rendering final scene at %d target timesteps...",
+            target_dict["target_image"].shape[1],
+        )
         input_dict.update(scene)
         input_dict = model(input_dict, stage=2, motion=False)
         pred_dict = model(input_dict, stage=3)
@@ -329,6 +349,8 @@ def compute_metrics(pred_dict, target_dict, input_dict, device):
         ssim_val = ssim(pr_np, gt_np, data_range=1.0, channel_axis=-1)
         metrics["ssim"].append(float(ssim_val))
 
+        ssim_map = None
+
         # Occupied PSNR/SSIM
         occ = occ_flat[idx]
         if occ.any():
@@ -336,7 +358,9 @@ def compute_metrics(pred_dict, target_dict, input_dict, device):
             gt_occ = rearrange(gt_flat[idx], "h w c -> c h w")[:, occ]
             mse_occ = F.mse_loss(pr_occ, gt_occ).item()
             metrics["occupied_psnr"].append(-10.0 * np.log10(max(mse_occ, 1e-12)))
-            ssim_map = ssim(pr_np, gt_np, data_range=1.0, channel_axis=-1, full=True)[1]
+            ssim_map = ssim(
+                pr_np, gt_np, data_range=1.0, channel_axis=-1, full=True
+            )[1]
             occ_np = occ.cpu().numpy()
             metrics["occupied_ssim"].append(float(ssim_map[occ_np].mean()))
 
@@ -347,7 +371,7 @@ def compute_metrics(pred_dict, target_dict, input_dict, device):
             gt_dyn = rearrange(gt_flat[idx], "h w c -> c h w")[:, dm]
             mse_dyn = F.mse_loss(pr_dyn, gt_dyn).item()
             metrics["dynamic_psnr"].append(-10.0 * np.log10(max(mse_dyn, 1e-12)))
-            if "ssim_map" not in dir():
+            if ssim_map is None:
                 ssim_map = ssim(pr_np, gt_np, data_range=1.0, channel_axis=-1, full=True)[1]
             dyn_np = dm.cpu().numpy()
             metrics["dynamic_ssim"].append(float(ssim_map[dyn_np].mean()))
