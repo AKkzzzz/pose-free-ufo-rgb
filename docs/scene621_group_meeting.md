@@ -227,13 +227,13 @@ E2 中，建场景和渲染都使用同一次 Omega 推理的 pose。整套坐�
 
 ## 9. 实验限制和下一步
 
-- 目前只有一个训练场景和一个固定 2 秒窗口；
+- 目前只有一个训练场景；短窗口和整段长序列结果都属于 scene621 场景内拟合；
 - UFO 在 scene621 上训练并在 scene621 上评估，是场景内拟合实验；
 - E2 使用了 target RGB 和 target GT Sim(3)，不是严格未知目标视角；
 - 当前只替换外参，仍使用 Waymo GT 内参；
 - 正式结论需要多个窗口、多个场景的均值和方差。
 
-建议下一步优先做：同一个 scene621 checkpoint 上评估多个 `start_idx`，确认 E1/E2 的下降是否稳定；随后扩展到多个 scene-specific checkpoint。
+建议下一步优先扩展到多个 scene-specific checkpoint，报告跨场景均值和方差。
 
 ## 10. 组会展示文件
 
@@ -243,5 +243,42 @@ E2 中，建场景和渲染都使用同一次 Omega 推理的 pose。整套坐�
 outputs/scene621_group_meeting/
 ```
 
-其中三段视频均为纯 render，无 GT、无文字标注。每段为 16 帧、10 FPS、720 x 160；一帧横向排列 3 个 240 x 160 相机视图。
+原来的三段短视频均为纯 render，无 GT、无文字标注。每段为 16 帧、10 FPS、720 x 160；一帧横向排列 3 个 240 x 160 相机视图。
 
+## 11. scene621 整段长序列
+
+为了观察短窗口之外的稳定性，新增整段 198 帧结果。实现采用 10 个滑动窗口，起点为：
+
+```text
+0, 20, 40, 60, 80, 100, 120, 140, 160, 178
+```
+
+每个窗口使用该时间段内的 4 个 context frame 独立建立 UFO scene，渲染窗口内全部 20 个相机时刻；窗口之间清空 UFO scene state，最后按原始 frame id 去重并拼接。末窗口保留 180--197，因此最终严格覆盖 scene621 的 0--197 共 198 帧。
+
+这里的“长序列”是完整场景的滑窗重建展示，不代表 UFO 在一个隐状态里连续记忆了 19.8 秒。这样做与训练时 4 chunk / 20 frame 的时间范围一致，也避免无限累积 Gaussian token 超出训练分布并占满 4090 显存。
+
+三条视频仍然只有模型 render，横向顺序为 camera 1 / camera 0 / camera 2（左前 / 正前 / 右前），没有 GT、标签或说明文字。规格统一为 198 帧、19.8 秒、10 FPS、720 x 160。
+
+| 长序列实验 | PSNR | SSIM | Dynamic PSNR | 相对 E0 PSNR |
+| --- | ---: | ---: | ---: | ---: |
+| E0 GT context + GT render pose | 24.48 | 0.7805 | 19.83 | 0.00 |
+| E1 Omega context + GT render pose | 18.10 | 0.3677 | 17.13 | -6.38 |
+| E2 Omega context + Omega render pose | 22.59 | 0.7014 | 19.45 | -1.88 |
+
+长序列还暴露出一个短视频看不到的现象：E0 在 frame 80--139 的窗口约为 26--27 dB，但 frame 160 以后约为 21 dB。说明 scene621 单场景训练 10k 后，不同时间段的拟合质量仍不均匀。
+
+长序列展示目录：
+
+```text
+outputs/scene621_group_meeting/long_sequence/
+├── long_sequence_metrics.csv
+├── long_sequence_metrics.json
+├── E0_GT/E0_GT_full_scene_render_3cam.mp4
+├── E0_GT/metrics.json
+├── E1_Omega_context/E1_Omega_context_full_scene_render_3cam.mp4
+├── E1_Omega_context/metrics.json
+├── E2_Omega_all/E2_Omega_all_full_scene_render_3cam.mp4
+└── E2_Omega_all/metrics.json
+```
+
+每个 `metrics.json` 同时包含整段汇总和 10 个窗口的分段指标；每个 `frame_mapping.json` 记录视频帧到原始 scene frame 的逐帧映射。

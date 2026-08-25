@@ -534,13 +534,14 @@ class UFODataset(Dataset):
                 initial_start_frame = context_frame_idx
                 
             # Validate and adjust if necessary
-            if initial_start_frame + num_max_future_frames >= num_timesteps:
+            if initial_start_frame + num_max_future_frames > num_timesteps:
                 initial_start_frame = np.random.randint(0, max(1, num_timesteps - num_max_future_frames))
             
             value_list = []
             
             first_context_idx = None
             last_frame_idx = initial_start_frame + num_max_future_frames
+            global_reference_frame_idx = min(last_frame_idx, num_timesteps - 1)
 
             # get all possible instances
             frame_instances = scene_json['frame_instances']
@@ -616,7 +617,9 @@ class UFODataset(Dataset):
 
                 reverse = self.reverse
                 # Generate target frame indices for this window
-                if getattr(self.args, "paper_frame_protocol", False):
+                if getattr(self.args, "full_window_targets", False):
+                    target_frame_idx = np.arange(window_start, window_end)
+                elif getattr(self.args, "paper_frame_protocol", False):
                     # The paper fixes the frame partition but does not disclose
                     # whether training renders these frames per chunk or from S_T.
                     target_frame_idx = np.asarray(frame_protocol.supervision)
@@ -684,7 +687,7 @@ class UFODataset(Dataset):
                         scene_json=scene_json,
                         frame_idx=ctx_id,
                         source_frame_idx=window_context_indices[0],
-                        global_source_frame_idx=last_frame_idx,
+                        global_source_frame_idx=global_reference_frame_idx,
                         available_instances=available_instances,
                         pose_role="context",
                     )
@@ -692,7 +695,7 @@ class UFODataset(Dataset):
                         if context_dict['flow'].abs().mean() - 0 > 1e-5:
                             return self.__getitem__(index + 1, context_frame_idx, return_all)
                     context_dict["time"] = torch.tensor(
-                        [time_in_seconds[ctx_id] - time_in_seconds[last_frame_idx]]
+                        [time_in_seconds[ctx_id] - time_in_seconds[global_reference_frame_idx]]
                         * self.num_max_cams
                     )
                     context_dict_list.append(context_dict)
@@ -707,12 +710,12 @@ class UFODataset(Dataset):
                         scene_json=scene_json,
                         frame_idx=target_id,
                         source_frame_idx=window_context_indices[0],
-                        global_source_frame_idx=last_frame_idx,
+                        global_source_frame_idx=global_reference_frame_idx,
                         available_instances=available_instances,
                         pose_role="target",
                     )
                     target_dict["time"] = torch.tensor(
-                        [time_in_seconds[target_id] - time_in_seconds[last_frame_idx]]
+                        [time_in_seconds[target_id] - time_in_seconds[global_reference_frame_idx]]
                         * self.num_max_cams
                     )
                     target_dict_list.append(target_dict)

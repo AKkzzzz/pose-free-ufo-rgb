@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from ufo.dataset.constants import DATASET_DICT, DATASETS
 from ufo.dataset.dataset import UFODataset
+from ufo.paper_contract import split_context_supervision
 
 
 def parse_args():
@@ -24,6 +25,10 @@ def parse_args():
     parser.add_argument("--annotation-file", type=Path, required=True)
     parser.add_argument("--scene-index", type=int, required=True)
     parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument(
+        "--metadata-only", action="store_true",
+        help="Derive the paper frame protocol without decoding RGB/masks",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -45,26 +50,44 @@ def main():
         "num_bbox": config.get("num_bbox", 32),
     })
     dataset_args = Namespace(**config)
-    dataset = UFODataset(
-        data_root=str(cli.data_root),
-        annotation_txt_file_list=str(cli.annotation_file),
-        subset_indices=[cli.scene_index],
-        target_size=tuple(config["input_size"]),
-        num_context_timesteps=config["num_context_timesteps"],
-        num_target_timesteps=config["num_target_timesteps"],
-        num_max_cams=config["num_max_cameras"],
-        timespan=config["timespan"],
-        equispaced=True,
-        load_depth=False,
-        load_flow=False,
-        load_dynamic_mask=False,
-        load_ground_label=False,
-        skip_sky_mask=True,
-        num_target_chunks=config["num_target_chunks"],
-        args=dataset_args,
-    )
-    chunks = dataset.__getitem__(0, cli.start_index, return_all=True)
-    scene_json = dataset.annotations[0]
+    if cli.metadata_only:
+        if not config.get("paper_frame_protocol", False):
+            raise ValueError("--metadata-only currently requires paper_frame_protocol")
+        annotation_paths = [line.strip() for line in cli.annotation_file.read_text().splitlines()]
+        annotation_path = Path(annotation_paths[cli.scene_index])
+        if not annotation_path.is_absolute():
+            annotation_path = cli.data_root / annotation_path
+        scene_json = json.loads(annotation_path.read_text())
+        frames_per_window = int(config["timespan"] * scene_json["fps"])
+        chunks = []
+        for chunk_index in range(config["num_target_chunks"]):
+            window_start = cli.start_index + chunk_index * frames_per_window
+            protocol = split_context_supervision(window_start, window_start + frames_per_window)
+            chunks.append({
+                "context": {"frame_idx": np.asarray(protocol.context)},
+                "target": {"frame_idx": np.asarray(protocol.supervision)},
+            })
+    else:
+        dataset = UFODataset(
+            data_root=str(cli.data_root),
+            annotation_txt_file_list=str(cli.annotation_file),
+            subset_indices=[cli.scene_index],
+            target_size=tuple(config["input_size"]),
+            num_context_timesteps=config["num_context_timesteps"],
+            num_target_timesteps=config["num_target_timesteps"],
+            num_max_cams=config["num_max_cameras"],
+            timespan=config["timespan"],
+            equispaced=True,
+            load_depth=False,
+            load_flow=False,
+            load_dynamic_mask=False,
+            load_ground_label=False,
+            skip_sky_mask=True,
+            num_target_chunks=config["num_target_chunks"],
+            args=dataset_args,
+        )
+        chunks = dataset.__getitem__(0, cli.start_index, return_all=True)
+        scene_json = dataset.annotations[0]
     dataset_name = scene_json["dataset"]
     cameras = DATASET_DICT[dataset_name]["camera_list"][config["num_max_cameras"]]
     opencv_to_dataset = np.asarray(DATASETS[dataset_name]["opencv2dataset"], dtype=np.float64)
