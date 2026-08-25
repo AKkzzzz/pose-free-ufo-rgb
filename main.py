@@ -311,10 +311,11 @@ def get_args_parser():
     parser.add_argument("--object_soft_target_temperature", type=float, default=0.1)
     parser.add_argument(
         "--object_assignment_gt_mode",
-        choices=["predicted_mean", "lidar_anchor"],
+        choices=["predicted_mean", "lidar_anchor", "gaussian_coverage"],
         default="predicted_mean",
-        help="Public-v1 predicted mean or reproduction-decision LiDAR token anchor supervision.",
+        help="Select the geometry used to construct token-level object labels.",
     )
+    parser.add_argument("--object_gaussian_coverage_threshold", type=float, default=0.1)
     parser.add_argument("--training_sampling_mode", choices=["uniform", "dynamic_mixture"], default="uniform")
     parser.add_argument("--dynamic_rich_pool", type=str, default=None)
     parser.add_argument("--dynamic_sampling_ratio", type=float, default=0.0)

@@ -202,6 +202,35 @@ def points_to_oriented_boxes_distance(points, boxes, valid_mask):
     return distance.amin(dim=-1)
 
 
+def gaussian_labels_to_token_labels(
+    gaussian_labels, views, height, width, patch_size, num_classes, threshold
+):
+    """Aggregate per-Gaussian hard labels into spatial token coverage labels."""
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(f"coverage threshold must be in [0, 1], got {threshold}")
+    batch = gaussian_labels.shape[0]
+    expected = views * height * width
+    if gaussian_labels.shape[1] != expected:
+        raise ValueError(
+            f"expected {expected} Gaussian labels, got {gaussian_labels.shape[1]}"
+        )
+    one_hot = F.one_hot(gaussian_labels.long(), num_classes=num_classes).float()
+    coverage = rearrange(
+        one_hot, "b (v h w) k -> (b v) k h w", v=views, h=height, w=width
+    )
+    coverage = F.avg_pool2d(coverage, kernel_size=patch_size, stride=patch_size)
+    coverage = rearrange(
+        coverage, "(b v) k ph pw -> b (v ph pw) k", b=batch, v=views
+    )
+    max_object_coverage, object_index = coverage[..., 1:].max(dim=-1)
+    labels = torch.where(
+        max_object_coverage >= threshold,
+        object_index + 1,
+        torch.zeros_like(object_index),
+    )
+    return labels, max_object_coverage
+
+
 def expand_spatial_token_assignments(token_weights, views, height, width, patch_size=8):
     """Broadcast each patch token to its spatially corresponding Gaussians."""
     b, t, tokens_per_time, classes = token_weights.shape
@@ -1393,13 +1422,47 @@ class UFO(ViT):
 
         with torch.no_grad():
             gt_prob = torch.zeros_like(token_probabilities)
+            gaussian_dynamic_ratios = []
+            coverage_maxima = []
             for _t in range(t):
-                gt_prob[:, _t] = points_in_boxes_probability(
-                    assignment_means[:, _t].detach(),
-                    data_dict['context_instances_corner'][:, _t],
-                    data_dict['context_instances_id'][:, _t],
-                    temperature=0.01,
-                )
+                if self.args.object_assignment_gt_mode == "gaussian_coverage":
+                    gaussian_prob = points_in_boxes_probability(
+                        t_means[:, _t].detach(),
+                        data_dict['context_instances_corner'][:, _t],
+                        data_dict['context_instances_id'][:, _t],
+                        temperature=0.01,
+                    )
+                    gaussian_labels = gaussian_prob.argmax(dim=-1)
+                    token_labels, max_coverage = gaussian_labels_to_token_labels(
+                        gaussian_labels,
+                        views=v,
+                        height=h,
+                        width=w,
+                        patch_size=self.unpatch_size,
+                        num_classes=1 + self.num_bbox,
+                        threshold=self.args.object_gaussian_coverage_threshold,
+                    )
+                    gt_prob[:, _t] = F.one_hot(
+                        token_labels, num_classes=1 + self.num_bbox
+                    ).to(gt_prob.dtype)
+                    gaussian_dynamic_ratios.append(
+                        (gaussian_labels > 0).float().mean()
+                    )
+                    coverage_maxima.append(max_coverage)
+                else:
+                    gt_prob[:, _t] = points_in_boxes_probability(
+                        assignment_means[:, _t].detach(),
+                        data_dict['context_instances_corner'][:, _t],
+                        data_dict['context_instances_id'][:, _t],
+                        temperature=0.01,
+                    )
+            if gaussian_dynamic_ratios:
+                data_dict['object_gaussian_dynamic_gt_ratio'] = torch.stack(
+                    gaussian_dynamic_ratios
+                ).mean()
+                data_dict['object_gaussian_coverage_max_mean'] = torch.cat(
+                    coverage_maxima, dim=1
+                ).mean()
 
             if getattr(self.args, "renderer_assignment_coordinate_diagnostics", False):
                 data_dict['renderer_coordinate_diagnostics_enabled'] = torch.ones(

@@ -4,7 +4,10 @@ from types import SimpleNamespace
 import torch
 
 from ufo.models.vit import Mlp
-from ufo.models.archs.small import points_to_oriented_boxes_distance
+from ufo.models.archs.small import (
+    gaussian_labels_to_token_labels,
+    points_to_oriented_boxes_distance,
+)
 from ufo.paper_contract import (
     GAUSSIANS_PER_TOKEN,
     expand_token_assignments,
@@ -80,6 +83,25 @@ def test_oriented_box_distance_is_zero_inside_and_metric_outside():
         points, box, torch.tensor([[True]])
     )
     assert torch.allclose(distance, torch.tensor([[0.0, 2.0]]))
+
+
+def test_gaussian_coverage_requires_seven_of_64_for_ten_percent_threshold():
+    labels = torch.zeros(1, 8 * 8, dtype=torch.long)
+    labels[:, :6] = 2
+    token_labels, coverage = gaussian_labels_to_token_labels(
+        labels, views=1, height=8, width=8, patch_size=8,
+        num_classes=4, threshold=0.1,
+    )
+    assert token_labels.item() == 0
+    assert torch.isclose(coverage, torch.tensor([[6 / 64]])).all()
+
+    labels[:, 6] = 2
+    token_labels, coverage = gaussian_labels_to_token_labels(
+        labels, views=1, height=8, width=8, patch_size=8,
+        num_classes=4, threshold=0.1,
+    )
+    assert token_labels.item() == 2
+    assert torch.isclose(coverage, torch.tensor([[7 / 64]])).all()
 
 
 def test_aux_outputs_are_split_from_recurrent_aux_sequence():

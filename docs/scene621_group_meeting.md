@@ -358,7 +358,18 @@ start=140 的正式累计 class loss 中只有 1--2 个动态 token，且 checkp
 尚未确定：scene update 后旧 token 的 ownership 是否需要重新分配
 ```
 
-本轮没有修改训练 GT、没有启动重训。
+上述 renderer 坐标诊断阶段没有修改训练 GT，也没有重训。
+
+### R1 Gaussian-to-token coverage 续训
+
+下一阶段保持 token-level `bbox_query_head` 和 64 Gaussian 共享预测 ownership 不变，只把 assignment GT 改为：先对每个 Gaussian 做 GT bbox 硬判定，再按真实 8×8 空间块统计同一 object coverage；最大 object coverage 至少为 10%（即至少 7/64）时，token 才标为该动态物体，否则仍为背景。
+
+R1 从原 scene621 10k checkpoint 恢复 optimizer、loss scaler 和 iteration，在独立目录续训到 iteration 12000。1-step smoke 的起始指标为：`dynamic_gt_ratio=1.34%`、平均 `dynamic_gt_count=54.25/chunk`、foreground recall `0%`、background probability `0.9997`。这证明新监督已经产生足量正样本，同时保留了旧 checkpoint collapse 状态作为干净的微调起点。
+
+```text
+config: configs/experiments/ufo_scene621_r1_gaussian_coverage_resume10k_2k_4090.json
+output: outputs/scene621_assignment_r1/gaussian_coverage_resume10k_2k/
+```
 
 Oracle 几何自检通过：start=0 被分配 Gaussian 到 bbox 中心的最大距离为 5.37 m，所涉 bbox 最大半对角线为 5.61 m；object pose 旋转正交误差最大为 `1.8e-7`。这排除了早期调试中 identity slot 导致的百米假位移。
 
