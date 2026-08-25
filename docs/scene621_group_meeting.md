@@ -354,7 +354,9 @@ start=140 的正式累计 class loss 中只有 1--2 个动态 token，且 checkp
 已确定：renderer class-loss 使用 global token + global bbox
 已确定：Gaussian-level 有正样本，但 token-level 正样本为 0 或极少
 
-尚未确定：token-level supervision 改造后是否足以解决全部动态问题
+已确定：Gaussian coverage 监督能让 assignment head 脱离全背景解
+
+尚未确定：如何抑制错误前景 assignment 和远距离错误搬运
 尚未确定：scene update 后旧 token 的 ownership 是否需要重新分配
 ```
 
@@ -364,12 +366,49 @@ start=140 的正式累计 class loss 中只有 1--2 个动态 token，且 checkp
 
 下一阶段保持 token-level `bbox_query_head` 和 64 Gaussian 共享预测 ownership 不变，只把 assignment GT 改为：先对每个 Gaussian 做 GT bbox 硬判定，再按真实 8×8 空间块统计同一 object coverage；最大 object coverage 至少为 10%（即至少 7/64）时，token 才标为该动态物体，否则仍为背景。
 
-R1 从原 scene621 10k checkpoint 恢复 optimizer、loss scaler 和 iteration，在独立目录续训到 iteration 12000。1-step smoke 的起始指标为：`dynamic_gt_ratio=1.34%`、平均 `dynamic_gt_count=54.25/chunk`、foreground recall `0%`、background probability `0.9997`。这证明新监督已经产生足量正样本，同时保留了旧 checkpoint collapse 状态作为干净的微调起点。
+R1 从原 scene621 10k checkpoint 恢复 optimizer、loss scaler 和 iteration，在独立目录续训。1-step smoke 的起始指标为：`dynamic_gt_ratio=1.34%`、平均 `dynamic_gt_count=54.25/chunk`、foreground recall `0%`、background probability `0.9997`。这证明新监督已经产生足量正样本，同时保留了旧 checkpoint collapse 状态作为干净的微调起点。
+
+第一轮在 RTX 4090 上续训 1,000 step，固定使用 `ckpt_010999.pth` 做评测。训练峰值显存为 28,239 MiB。到 step 11,000，训练 batch 的 foreground recall 已从 0% 上升到 67.3%，background probability 从 0.9997 降至 0.9324，说明 assignment head 确实脱离了全背景解。
+
+固定窗口结果如下。R0 和 R1 使用相同 RGB、相机参数、target frames 和 renderer；只更换 checkpoint。R0 的训练 GT 是原 token-center 方法，R1 的训练及评测 assignment GT 是 Gaussian coverage 方法，因此表中的 render 指标可直接比较，GT ratio/recall 只用于描述 R1 自身的 assignment 行为。
+
+| Window | 模型 | PSNR | Dynamic PSNR | R1 foreground recall | R1 foreground precision | 预测动态比例 | 背景概率 | Gaussian 平均位移 | 最大位移 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0--19 | R0 10k | 24.125 | 18.743 | -- | -- | 0.000% | 0.999985 | 0.000029 m | 0.020 m |
+| 0--19 | R1 +1k | 22.948 | 18.700 | 70.59% | 14.17% | 3.528% | 0.932247 | 0.1291 m | 40.276 m |
+| 140--159 | R0 10k | 23.449 | 18.820 | -- | -- | 0.000% | 0.999544 | 0.000860 m | 1.367 m |
+| 140--159 | R1 +1k | 23.164 | 19.298 | 93.88% | 50.00% | 3.833% | 0.949515 | 0.0510 m | 47.248 m |
+
+结果分成两层。第一层是正向验证：start=140 的 Dynamic PSNR 提升 0.478 dB，foreground recall 达到 93.9%，车辆 Gaussian 在窗口内产生逐帧位移，证明原 token-center GT 过稀确实是 background collapse 的关键原因之一。第二层是当前失败点：start=0 的总 PSNR 下降 1.178 dB，两个窗口都出现 40--47 m 的最大位移；检查发现被分配 Gaussian 到对应 bbox 中心的距离可达约 159 m，而车辆 bbox 半对角线最大只有约 5.61 m。视频中相较 R0 出现更明显的动态拖影，尚不能称为车辆运动已经正确恢复。
+
+因此当前决策是：R1 验证了 supervision 方向，但 10% hard coverage 不能直接用于 R2 scratch 10k。下一步应先约束 false-positive ownership，例如让 loss 使用 coverage soft target / foreground-balanced 权重，并在推理搬运前增加 ownership 几何一致性检查；随后再做 1k 固定窗口复验。暂不改 Gaussian-level prediction head，也暂不启动 R2。
 
 ```text
 config: configs/experiments/ufo_scene621_r1_gaussian_coverage_resume10k_2k_4090.json
 output: outputs/scene621_assignment_r1/gaussian_coverage_resume10k_2k/
 ```
+
+R1 checkpoint、指标和纯 render 视频位于：
+
+```text
+outputs/scene621_assignment_r1/gaussian_coverage_resume10k_2k/checkpoints/ckpt_010999.pth
+
+outputs/scene621_group_meeting/dynamic_assignment_r1/
+├── r1_fixed_window_summary.csv
+├── r1_fixed_window_summary.json
+├── start_000/
+│   ├── dynamic_assignment_comparison.json
+│   ├── D_predicted_start_000_diagnostics.json
+│   ├── D_predicted_start_000_render_3cam.mp4
+│   └── R0_top_R1_bottom_start_000_render_3cam.mp4
+└── start_140/
+    ├── dynamic_assignment_comparison.json
+    ├── D_predicted_start_140_diagnostics.json
+    ├── D_predicted_start_140_render_3cam.mp4
+    └── R0_top_R1_bottom_start_140_render_3cam.mp4
+```
+
+两个 R1 单独视频都是 20 帧、10 FPS、720 x 160 的三摄像头纯 render。两个对照视频仍无 GT 和文字覆盖：上半部分为 R0，下半部分为 R1，每一行横向排列三个相机。
 
 Oracle 几何自检通过：start=0 被分配 Gaussian 到 bbox 中心的最大距离为 5.37 m，所涉 bbox 最大半对角线为 5.61 m；object pose 旋转正交误差最大为 `1.8e-7`。这排除了早期调试中 identity slot 导致的百米假位移。
 
