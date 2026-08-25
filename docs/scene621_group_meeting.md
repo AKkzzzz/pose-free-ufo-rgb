@@ -320,21 +320,45 @@ outputs/scene621_group_meeting/long_sequence/camera_matrix/
 
 ```text
 D0 predicted：使用 checkpoint 原本预测的 bbox assignment
-D1 oracle_bbox：最终 Gaussian 中心落在 GT 3D bbox 内时，硬分配给该物体；否则分配为背景
+D1 stable-track bbox Oracle：最终 Gaussian 中心落在 GT 3D bbox 内时，硬分配给该物体；否则分配为背景
 ```
 
-D1 不改网络、不训练，也不使用 LiDAR。它仍使用原版 `context_instances_pose -> target_instances_pose` 搬运 Gaussian，只把 assignment 换成 GT bbox 几何 Oracle。长序列实现会先取完整 20 帧都有效的物体槽位，并在最终 scene token 更新和 Gaussian 重解码之后重新判框，避免缺失槽位的 identity pose 和陈旧 assignment 污染结果。
+D1 不改网络、不训练，也不使用 LiDAR。它仍使用原版 `context_instances_pose -> target_instances_pose` 搬运 Gaussian，只把 assignment 换成 GT bbox 几何 Oracle。长序列实现会先取完整 20 帧都有效的物体槽位，并在最终 scene token 更新和 Gaussian 重解码之后重新判框，避免缺失槽位的 identity pose 和陈旧 assignment 污染结果。由于中途进入、离开、遮挡或 annotation 暂缺的轨迹都被当作背景，D1 是 stable-track Oracle，测得的收益是完整 Oracle 收益的下界。
 
 | Window | 模式 | Target pose 相邻帧平移 | 背景概率 | 硬动态比例 | Gaussian 平均位移 | PSNR | Dynamic PSNR |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0--19 | D0 predicted | 0.236 m | 0.999985 | 0.000% | 0.000029 m | 24.125 | 18.743 |
-| 0--19 | D1 Oracle | 0.236 m | 0.996495 | 0.350% | 0.005532 m | 24.272 | 18.932 |
+| 0--19 | D1 stable-track Oracle | 0.236 m | 0.996495 | 0.350% | 0.005532 m | 24.272 | 18.932 |
 | 140--159 | D0 predicted | 0.153 m | 0.999544 | 0.000% | 0.000860 m | 23.449 | 18.820 |
-| 140--159 | D1 Oracle | 0.153 m | 0.988231 | 1.177% | 0.006919 m | 23.833 | 19.420 |
+| 140--159 | D1 stable-track Oracle | 0.153 m | 0.988231 | 1.177% | 0.006919 m | 23.833 | 19.420 |
 
 判断属于情况 B，而不是长视频 target pose repeat：两个窗口的 GT object pose 都逐帧变化，但 D0 硬 assignment 全为背景，最终 Gaussian 基本不动。D1 在 start=140 上使 PSNR 提升 0.384 dB、Dynamic PSNR 提升 0.601 dB，并产生合理的逐帧物体位移，因此 object assignment 是当前动态链路的第一故障点。
 
-进一步检查发现一个比 token 粒度更直接的训练监督问题：`gs_token_means` 在当前窗口的 local canonical 坐标中计算，但现有 `points_in_boxes_probability()` 使用 global canonical 的 `context_instances_corner` 生成 GT label。scene621 的统计因此出现 `object_dynamic_gt_count=0`，训练目标本身就是全背景。正确的同坐标输入是代码中已经存在的 `context_instances_corner_local`。本轮只用它构造 inference Oracle，尚未修改训练目标，也没有重训 checkpoint。
+`a7bface` 初版文档曾把 collapse 归因于 local `gs_token_means` 和 global bbox 错配。该判断混淆了 stage2 的局部中间量和 `forward_renderer()` 的最终 class-loss 输入，现已撤回。`update_scene()` 会先把 token means 转到 global scene，render 前再用累计 scene 重新 stage2；class loss 实际使用的是 global `gs_token_means` 和 global `context_instances_corner`。不能把训练 GT 直接改成 `context_instances_corner_local`。
+
+为了在 class-loss 真正发生的位置验证，新增 renderer-time 坐标诊断。它保持 recurrent `update_scene(render=True)` 链路，对当前 chunk 的同一批 token 分别计算 global/local bbox 标签，并同时检查最终 Gaussian 是否落框。
+
+| Window | Chunk | 当前 token 的 global 正样本 | local 正样本 | Gaussian global 正样本 | Gaussian 正样本比例 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0--19 | 0 / 1 / 2 / 3 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 788 / 859 / 833 / 803 | 0.684%--0.746% |
+| 140--159 | 0 / 1 / 2 / 3 | 1 / 1 / 0 / 0 | 0 / 1 / 0 / 0 | 2025 / 2083 / 2035 / 1945 | 1.688%--1.808% |
+
+start=140 的正式累计 class loss 中只有 1--2 个动态 token，且 checkpoint 对这些正样本的 foreground recall 为 0%。与此同时，同一时刻有约 2,000 个 Gaussian 落在车辆框内。因此现有证据更支持：64 个 Gaussian 聚合成一个 8×8 scene-token 均值后，车辆正样本消失或变得极端稀疏；随后严重类别不平衡和 coarse ownership 使 assignment head collapse。它仍是诊断结论，不等于已经证明唯一根因；scene update 后 ownership 是否陈旧仍需单独实验。
+
+现在可以确定和不能确定的边界是：
+
+```text
+已确定：target object pose 逐帧变化
+已确定：checkpoint assignment 近乎全部 background
+已确定：stable-track bbox Oracle 改善动态指标
+已确定：renderer class-loss 使用 global token + global bbox
+已确定：Gaussian-level 有正样本，但 token-level 正样本为 0 或极少
+
+尚未确定：token-level supervision 改造后是否足以解决全部动态问题
+尚未确定：scene update 后旧 token 的 ownership 是否需要重新分配
+```
+
+本轮没有修改训练 GT、没有启动重训。
 
 Oracle 几何自检通过：start=0 被分配 Gaussian 到 bbox 中心的最大距离为 5.37 m，所涉 bbox 最大半对角线为 5.61 m；object pose 旋转正交误差最大为 `1.8e-7`。这排除了早期调试中 identity slot 导致的百米假位移。
 
@@ -343,6 +367,10 @@ Oracle 几何自检通过：start=0 被分配 Gaussian 到 bbox 中心的最大�
 ```text
 outputs/scene621_group_meeting/dynamic_assignment_diagnostic/
 ├── dynamic_assignment_summary.csv
+├── renderer_coordinates/
+│   ├── renderer_assignment_coordinates_summary.csv
+│   ├── renderer_assignment_coordinates_start_000.json
+│   └── renderer_assignment_coordinates_start_140.json
 ├── start_000/
 │   ├── dynamic_assignment_comparison.json
 │   ├── D_predicted_start_000_render_3cam.mp4

@@ -180,6 +180,28 @@ def points_in_boxes_probability(points, boxes, valid_mask, temperature=0.1, back
     return probs
 
 
+def points_to_oriented_boxes_distance(points, boxes, valid_mask):
+    """Return each point's metric distance to the nearest valid oriented box."""
+    centers = boxes.mean(dim=2)
+    edge_x = boxes[:, :, 1] - boxes[:, :, 0]
+    edge_y = boxes[:, :, 2] - boxes[:, :, 0]
+    edge_z = boxes[:, :, 4] - boxes[:, :, 0]
+    extents = torch.stack([
+        edge_x.norm(dim=-1), edge_y.norm(dim=-1), edge_z.norm(dim=-1)
+    ], dim=-1) / 2.0
+    axes = torch.stack([
+        F.normalize(edge_x, dim=-1),
+        F.normalize(edge_y, dim=-1),
+        F.normalize(edge_z, dim=-1),
+    ], dim=-2)
+    relative = points[:, :, None] - centers[:, None]
+    local = torch.einsum("bmij,bnmj->bnmi", axes, relative)
+    outside = (local.abs() - extents[:, None]).clamp_min(0)
+    distance = outside.norm(dim=-1)
+    distance = distance.masked_fill(~valid_mask.bool()[:, None], float("inf"))
+    return distance.amin(dim=-1)
+
+
 def expand_spatial_token_assignments(token_weights, views, height, width, patch_size=8):
     """Broadcast each patch token to its spatially corresponding Gaussians."""
     b, t, tokens_per_time, classes = token_weights.shape
@@ -1379,6 +1401,90 @@ class UFO(ViT):
                     temperature=0.01,
                 )
 
+            if getattr(self.args, "renderer_assignment_coordinate_diagnostics", False):
+                data_dict['renderer_coordinate_diagnostics_enabled'] = torch.ones(
+                    (), device=assignment_means.device
+                )
+                local_corners = data_dict.get('context_instances_corner_local')
+                if local_corners is not None:
+                    # input_dict retains only the current chunk's local boxes,
+                    # while scene-backed tensors contain all accumulated chunks.
+                    sample_t = min(t, local_corners.shape[1])
+                    sample_means = assignment_means[:, -sample_t:].detach().float()
+                    global_corners = data_dict['context_instances_corner'][:, -sample_t:].float()
+                    global_valid = data_dict['context_instances_id'][:, -sample_t:]
+                    local_corners = local_corners[:, -sample_t:].float()
+                    global_labels = []
+                    local_labels = []
+                    global_distances = []
+                    local_distances = []
+                    for diagnostic_t in range(sample_t):
+                        points = sample_means[:, diagnostic_t]
+                        valid = global_valid[:, diagnostic_t]
+                        global_labels.append(points_in_boxes_probability(
+                            points, global_corners[:, diagnostic_t], valid,
+                            temperature=0.01,
+                        ).argmax(dim=-1))
+                        local_labels.append(points_in_boxes_probability(
+                            points, local_corners[:, diagnostic_t], valid,
+                            temperature=0.01,
+                        ).argmax(dim=-1))
+                        global_distances.append(points_to_oriented_boxes_distance(
+                            points, global_corners[:, diagnostic_t], valid,
+                        ))
+                        local_distances.append(points_to_oriented_boxes_distance(
+                            points, local_corners[:, diagnostic_t], valid,
+                        ))
+                    global_labels = torch.stack(global_labels, dim=1)
+                    local_labels = torch.stack(local_labels, dim=1)
+                    global_distances = torch.stack(global_distances, dim=1)
+                    local_distances = torch.stack(local_distances, dim=1)
+                    gaussian_labels = []
+                    for diagnostic_t in range(sample_t):
+                        gaussian_labels.append(points_in_boxes_probability(
+                            t_means[:, -sample_t + diagnostic_t].detach().float(),
+                            global_corners[:, diagnostic_t],
+                            global_valid[:, diagnostic_t],
+                            temperature=0.01,
+                        ).argmax(dim=-1))
+                    gaussian_labels = torch.stack(gaussian_labels, dim=1)
+                    corner_center_delta = (
+                        global_corners.mean(dim=-2) - local_corners.mean(dim=-2)
+                    ).norm(dim=-1)
+                    data_dict['renderer_diag_token_count'] = torch.tensor(
+                        global_labels.numel(), device=global_labels.device
+                    )
+                    data_dict['renderer_global_dynamic_gt_count'] = (
+                        global_labels > 0
+                    ).sum()
+                    data_dict['renderer_local_dynamic_gt_count'] = (
+                        local_labels > 0
+                    ).sum()
+                    data_dict['renderer_global_gaussian_dynamic_gt_count'] = (
+                        gaussian_labels > 0
+                    ).sum()
+                    data_dict['renderer_global_gaussian_dynamic_gt_ratio'] = (
+                        gaussian_labels > 0
+                    ).float().mean()
+                    data_dict['renderer_global_nearest_bbox_distance_mean'] = (
+                        global_distances[torch.isfinite(global_distances)].mean()
+                    )
+                    data_dict['renderer_local_nearest_bbox_distance_mean'] = (
+                        local_distances[torch.isfinite(local_distances)].mean()
+                    )
+                    data_dict['renderer_global_nearest_bbox_distance_min'] = (
+                        global_distances.amin()
+                    )
+                    data_dict['renderer_local_nearest_bbox_distance_min'] = (
+                        local_distances.amin()
+                    )
+                    data_dict['renderer_global_local_bbox_center_delta_mean'] = (
+                        corner_center_delta[global_valid.bool()].mean()
+                    )
+                    data_dict['renderer_global_local_bbox_center_delta_max'] = (
+                        corner_center_delta[global_valid.bool()].max()
+                    )
+
         gt_soft_prob = gt_prob
         gt_prob = gt_soft_prob.argmax(dim=-1)
         loss_mask = (
@@ -1980,6 +2086,9 @@ class UFO(ViT):
                 chunk_data_dict["target_time"] = data_dict["target_time"][:, chunk_start:chunk_end]
                 chunk_data_dict["target_instances_pose"] = data_dict['target_instances_pose'][:, chunk_start:chunk_end]
                 chunk_render_results = self.forward_renderer(gs_params, chunk_data_dict)
+                for key, value in chunk_data_dict.items():
+                    if key.startswith("renderer_"):
+                        data_dict[key] = value
                 if chunk_start == 0:
                     render_results = chunk_render_results
                 else:

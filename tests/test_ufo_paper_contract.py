@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from ufo.models.vit import Mlp
+from ufo.models.archs.small import points_to_oriented_boxes_distance
 from ufo.paper_contract import (
     GAUSSIANS_PER_TOKEN,
     expand_token_assignments,
@@ -65,6 +66,20 @@ def test_scene_token_assignment_is_shared_by_64_gaussians():
     assert expanded.shape == (1, 128, 2)
     assert torch.equal(expanded[:, :64], token_weights[:, :1].expand(-1, 64, -1))
     assert torch.equal(expanded[:, 64:], token_weights[:, 1:].expand(-1, 64, -1))
+
+
+def test_oriented_box_distance_is_zero_inside_and_metric_outside():
+    box = torch.tensor([[[
+        [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0],
+        [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0],
+        [-1.0, 1.0, 1.0], [1.0, 1.0, 1.0],
+    ]]])
+    points = torch.tensor([[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]]])
+    distance = points_to_oriented_boxes_distance(
+        points, box, torch.tensor([[True]])
+    )
+    assert torch.allclose(distance, torch.tensor([[0.0, 2.0]]))
 
 
 def test_aux_outputs_are_split_from_recurrent_aux_sequence():

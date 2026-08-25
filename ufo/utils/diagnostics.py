@@ -165,6 +165,17 @@ def gaussian_metrics(output_dict, max_scale=None):
         "bbox_pose_mean_translation", "bbox_pose_max_translation",
         "bbox_pose_mean_rotation_deg", "bbox_pose_max_rotation_deg",
         "bbox_motion_mean_displacement", "bbox_motion_max_displacement",
+        "renderer_coordinate_diagnostics_enabled", "renderer_diag_token_count",
+        "renderer_global_dynamic_gt_count",
+        "renderer_local_dynamic_gt_count",
+        "renderer_global_gaussian_dynamic_gt_count",
+        "renderer_global_gaussian_dynamic_gt_ratio",
+        "renderer_global_nearest_bbox_distance_mean",
+        "renderer_local_nearest_bbox_distance_mean",
+        "renderer_global_nearest_bbox_distance_min",
+        "renderer_local_nearest_bbox_distance_min",
+        "renderer_global_local_bbox_center_delta_mean",
+        "renderer_global_local_bbox_center_delta_max",
     ):
         if key in output_dict:
             result[key] = output_dict[key].detach().float().item()
@@ -183,6 +194,17 @@ def assignment_metrics(output_dict):
         "bbox_pose_mean_translation", "bbox_pose_max_translation",
         "bbox_pose_mean_rotation_deg", "bbox_pose_max_rotation_deg",
         "bbox_motion_mean_displacement", "bbox_motion_max_displacement",
+        "renderer_coordinate_diagnostics_enabled", "renderer_diag_token_count",
+        "renderer_global_dynamic_gt_count",
+        "renderer_local_dynamic_gt_count",
+        "renderer_global_gaussian_dynamic_gt_count",
+        "renderer_global_gaussian_dynamic_gt_ratio",
+        "renderer_global_nearest_bbox_distance_mean",
+        "renderer_local_nearest_bbox_distance_mean",
+        "renderer_global_nearest_bbox_distance_min",
+        "renderer_local_nearest_bbox_distance_min",
+        "renderer_global_local_bbox_center_delta_mean",
+        "renderer_global_local_bbox_center_delta_max",
     ):
         if key in output_dict:
             result[key] = output_dict[key].detach().float().item()
