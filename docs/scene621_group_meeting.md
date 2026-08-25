@@ -381,7 +381,51 @@ R1 从原 scene621 10k checkpoint 恢复 optimizer、loss scaler 和 iteration�
 
 结果分成两层。第一层是正向验证：start=140 的 Dynamic PSNR 提升 0.478 dB，foreground recall 达到 93.9%，车辆 Gaussian 在窗口内产生逐帧位移，证明原 token-center GT 过稀确实是 background collapse 的关键原因之一。第二层是当前失败点：start=0 的总 PSNR 下降 1.178 dB，两个窗口都出现 40--47 m 的最大位移；检查发现被分配 Gaussian 到对应 bbox 中心的距离可达约 159 m，而车辆 bbox 半对角线最大只有约 5.61 m。视频中相较 R0 出现更明显的动态拖影，尚不能称为车辆运动已经正确恢复。
 
-因此当前决策是：R1 验证了 supervision 方向，但 10% hard coverage 不能直接用于 R2 scratch 10k。下一步应先约束 false-positive ownership，例如让 loss 使用 coverage soft target / foreground-balanced 权重，并在推理搬运前增加 ownership 几何一致性检查；随后再做 1k 固定窗口复验。暂不改 Gaussian-level prediction head，也暂不启动 R2。
+R1 阶段的决策是：它验证了 supervision 方向，但 10% hard coverage 不能直接用于 R2 scratch 10k；应先约束 false-positive ownership 并做 1k 固定窗口复验。后续 R1.5 采用下面的 geometry gate 路线，未改 Gaussian-level prediction head，也未启动 R2。
+
+### R1.5 Token ownership x Gaussian geometry gate
+
+R1 的进一步检查表明问题不是简单的 coverage threshold：token ownership 被直接广播给 8 x 8 的全部 64 个 Gaussian，而且累计 scene 在最终 `stage=2, motion=False` 重新 decode 后沿用旧 `bbox_weights`。因此 R1.5 保留 R1 的 token head 和 coverage supervision，只在每次最终 decode 后，用当前 global Gaussian XYZ 和当前 global oriented bbox 重算几何 gate：
+
+```text
+W_final(g, object) = W_token(object) * exp(-distance(g, bbox) / 0.5m)
+```
+
+bbox 内的 gate 为 1；bbox 外按 0.5 m metric margin 指数衰减；被 gate 拒绝的 object probability 全部归还 background，最终概率仍严格和为 1。gate 不增加可训练参数，不使用 LiDAR，也不把 token head 改成 Gaussian head。最重要的是，它在累计 scene 重新 decode 后重算，因此不会继续用陈旧 Gaussian 位置做运动 ownership。
+
+R1.5 从 R1 `ckpt_010999.pth` 恢复 optimizer、loss scaler 和 RNG，在 RTX 4090 上续训 1,000 step。最终 checkpoint 为 `ckpt_011999.pth`，训练耗时 25 分 42 秒，峰值显存 24,117 MiB。
+
+| Window | 模型 | PSNR | Dynamic PSNR | Gaussian recall | Gaussian precision | Gaussian hard dynamic | 最大位移 | 最远 assignment 到 bbox center |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0--19 | R0 10k | 24.125 | 18.743 | -- | -- | 0.000% | 0.020 m | -- |
+| 0--19 | R1 +1k | 22.948 | 18.700 | 46.47% | 3.85% | 3.528% | 40.276 m | 158.862 m |
+| 0--19 | R1.5 +1k | 23.518 | 18.674 | 29.83% | 80.05% | 0.089% | 6.232 m | 5.836 m |
+| 140--159 | R0 10k | 23.449 | 18.820 | -- | -- | 0.000% | 1.367 m | -- |
+| 140--159 | R1 +1k | 23.164 | 19.298 | 87.28% | 18.99% | 3.833% | 47.248 m | 159.383 m |
+| 140--159 | R1.5 +1k | 23.373 | 18.985 | 61.00% | 78.98% | 0.346% | 5.415 m | 5.711 m |
+
+R1.5 把 Gaussian precision 从 3.85% / 18.99% 提升到 80.05% / 78.98%，并把 40--47 m 的错误搬运压到 5--6 m；R1 中被错误 assignment 的百米外 Gaussian 已经消失。start=140 的全图 PSNR 相对 R0 只低 0.076 dB，Dynamic PSNR 比 R0 高 0.165 dB。视频里 R1 的大范围背景拖影也在 R1.5 中明显减轻。
+
+但 R1.5 还不是最终解：Gaussian recall 从 R1 的 46.47% / 87.28% 降到 29.83% / 61.00%，start=0 Dynamic PSNR 没有超过 R0，start=140 也没有保住 R1 的全部动态收益。当前瓶颈已经从 false ownership 转成 conservative geometry gate / bbox coverage recall。所以下一步应只研究如何扩大合理的几何支持，例如按 bbox 尺寸设置各向异性 margin 或监督 gate uncertainty；仍不应启动 R2 scratch 10k，也不应退回 token ownership 直接广播。
+
+```text
+config: configs/experiments/ufo_scene621_r15_geometry_gate_resume11k_1k_4090.json
+checkpoint: outputs/scene621_assignment_r15/geometry_gate_resume11k_1k/checkpoints/ckpt_011999.pth
+
+outputs/scene621_group_meeting/dynamic_assignment_r15/
+├── r15_fixed_window_summary.csv
+├── r15_fixed_window_summary.json
+├── start_000/
+│   ├── dynamic_assignment_comparison.json
+│   ├── D_predicted_start_000_render_3cam.mp4
+│   └── R0_top_R1_middle_R15_bottom_start_000_render_3cam.mp4
+└── start_140/
+    ├── dynamic_assignment_comparison.json
+    ├── D_predicted_start_140_render_3cam.mp4
+    └── R0_top_R1_middle_R15_bottom_start_140_render_3cam.mp4
+```
+
+三行对照视频均为纯 render：上行为 R0，中行为 R1，下行为 R1.5；每行横向排列三个相机，没有 GT 或文字覆盖。
 
 ```text
 config: configs/experiments/ufo_scene621_r1_gaussian_coverage_resume10k_2k_4090.json

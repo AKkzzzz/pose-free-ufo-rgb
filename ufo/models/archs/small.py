@@ -1458,6 +1458,7 @@ class UFO(ViT):
         with torch.no_grad():
             gt_prob = torch.zeros_like(token_probabilities)
             gaussian_dynamic_ratios = []
+            gaussian_gt_labels = []
             coverage_maxima = []
             for _t in range(t):
                 if self.args.object_assignment_gt_mode == "gaussian_coverage":
@@ -1468,6 +1469,7 @@ class UFO(ViT):
                         temperature=0.01,
                     )
                     gaussian_labels = gaussian_prob.argmax(dim=-1)
+                    gaussian_gt_labels.append(gaussian_labels)
                     token_labels, max_coverage = gaussian_labels_to_token_labels(
                         gaussian_labels,
                         views=v,
@@ -1498,6 +1500,25 @@ class UFO(ViT):
                 data_dict['object_gaussian_coverage_max_mean'] = torch.cat(
                     coverage_maxima, dim=1
                 ).mean()
+                gaussian_gt_labels = torch.stack(gaussian_gt_labels, dim=1)
+                gaussian_predictions = probabilities.argmax(dim=-1)
+                gaussian_dynamic_gt = gaussian_gt_labels > 0
+                gaussian_predicted_dynamic = gaussian_predictions > 0
+                data_dict['object_gaussian_predicted_dynamic_ratio'] = (
+                    gaussian_predicted_dynamic.float().mean()
+                )
+                if gaussian_dynamic_gt.any():
+                    data_dict['object_gaussian_foreground_recall'] = (
+                        gaussian_predictions[gaussian_dynamic_gt] > 0
+                    ).float().mean()
+                    data_dict['object_gaussian_dynamic_assignment_accuracy'] = (
+                        gaussian_predictions[gaussian_dynamic_gt]
+                        == gaussian_gt_labels[gaussian_dynamic_gt]
+                    ).float().mean()
+                if gaussian_predicted_dynamic.any():
+                    data_dict['object_gaussian_foreground_precision'] = (
+                        gaussian_gt_labels[gaussian_predicted_dynamic] > 0
+                    ).float().mean()
 
             if getattr(self.args, "renderer_assignment_coordinate_diagnostics", False):
                 data_dict['renderer_coordinate_diagnostics_enabled'] = torch.ones(
