@@ -1,24 +1,25 @@
-# Scene621：VGGT-Omega Pose 替换 UFO 实验
+# Scene621：VGGT-Omega 相机参数替换 UFO 实验
 
-这是一份面向组会汇报的完整说明。实验目标是回答：在同一个 UFO checkpoint、同一个场景和同一组 RGB 下，把 Waymo GT 相机外参换成 VGGT-Omega 预测外参，渲染质量会下降多少？
+这是一份面向组会汇报的完整说明。实验目标是回答：在同一个 UFO checkpoint、同一个场景和同一组 RGB 下，把 Waymo GT 相机外参 T 和内参 K 换成 VGGT-Omega 预测值，渲染质量会下降多少？
 
 ## 1. 一页结论
 
 我们没有把 VGGT-Omega 和 UFO 联合训练。VGGT-Omega 只作为 UFO 前面的相机位姿估计器：
 
 ```text
-RGB -> VGGT-Omega 预测 pose -> 坐标对齐 -> UFO 使用预测 pose 建场景/渲染
+RGB -> VGGT-Omega 预测 T 和 K -> 坐标/分辨率适配 -> UFO 建场景/渲染
 ```
 
 UFO 从零开始，只在 Waymo scene621 上训练 10,000 optimizer steps；训练过程全部使用 GT pose。VGGT-Omega 使用官方 1B/512 预训练权重，训练完成后才离线预测 pose。
 
-| 实验 | Context pose | Target pose | PSNR | Delta PSNR | SSIM |
+| 实验 | 外参 T | 内参 K | 长序列 PSNR | Delta PSNR | SSIM |
 | --- | --- | --- | ---: | ---: | ---: |
-| E0 | GT | GT | 24.190 dB | 0.000 dB | 0.8163 |
-| E1 | Omega context-only | GT | 17.837 dB | -6.353 dB | 0.3639 |
-| E2 | Omega all-frame | Omega all-frame | 22.433 dB | -1.757 dB | 0.7311 |
+| E0 | GT | GT | 24.478 dB | 0.000 dB | 0.7805 |
+| E1 | Omega | GT | 22.594 dB | -1.884 dB | 0.7014 |
+| E2 | GT | Omega | 23.542 dB | -0.935 dB | 0.7438 |
+| E3 | Omega | Omega | 23.504 dB | -0.973 dB | 0.7354 |
 
-主要观察：E1 下降 6.35 dB，但 E2 只下降 1.76 dB。说明 UFO 不仅要求单张图的 pose 准确，还非常依赖 context pose 和 target pose 是否处于一致的相机轨迹中。
+主要观察：只替换外参下降 1.88 dB，只替换内参下降 0.94 dB，说明 UFO 对外参更敏感；但完整替换只下降 0.97 dB，反而比只替换外参好 0.91 dB，说明同一次 Omega 推理产生的 T/K 一致性很重要。
 
 ## 2. 两个模型分别做什么
 
@@ -66,7 +67,7 @@ VGGT-Omega 不在 scene621 上训练，直接加载官方 `vggt_omega_1b_512.pt`
 
 ### 每组 UFO 推理的场景初始化
 
-E0/E1/E2 都加载同一个 UFO 10k checkpoint，并从空的 `scene = {}` 开始递推建立 Gaussian 场景。三组之间不共享场景状态。
+P0/P1/P2 都加载同一个 UFO 10k checkpoint，并从空的 `scene = {}` 开始递推建立 Gaussian 场景。三组之间不共享场景状态。
 
 ## 4. Context、Target 和 All-frame
 
@@ -168,9 +169,9 @@ all:     context=Omega, target=Omega
 
 旧 inference 虽然递推 4 个 chunk，但只计算最后一个 chunk 的指标。当前版本会在最终累计 scene 上渲染全部 16 个 target 时间点，也就是 48 张图，再统一计算指标。
 
-## 6. 三组实验具体做了什么
+## 6. 早期三组外参诊断
 
-### E0：GT 基线
+### P0：GT 基线
 
 ```text
 Context pose = GT
@@ -179,7 +180,7 @@ Target pose = GT
 
 Omega 不参与。它表示 scene621 10k UFO 在准确相机参数下的表现。
 
-### E1：Omega context-only
+### P1：Omega context-only
 
 ```text
 Omega 输入 = 12 张 context RGB
@@ -188,9 +189,9 @@ Target pose = GT
 Target RGB = 只用于评分，不进入 Omega
 ```
 
-E1 测量输入 pose 误差对 UFO 的直接影响。它是最重要、信息边界最干净的一组，但 context GT pose 仍参与 Sim(3) gauge 对齐，所以还不是完全无 GT 部署。
+P1 测量输入 pose 误差对 UFO 的直接影响。它是信息边界最干净的一组，但 context GT pose 仍参与 Sim(3) gauge 对齐，所以还不是完全无 GT 部署。
 
-### E2：Omega all-frame
+### P2：Omega all-frame
 
 ```text
 Omega 输入 = 12 张 context RGB + 48 张 target RGB
@@ -198,15 +199,15 @@ Context pose = Omega
 Target pose = Omega
 ```
 
-E2 测量 context 和 target 全部换成同一套 Omega pose 后，系统一致性能恢复多少。由于 Omega 看过 target RGB，并且 target GT pose 参与 Sim(3) 对齐，E2 只能称为“全部替换外参诊断”，不能称为严格 pose-free NVS。
+P2 测量 context 和 target 全部换成同一套 Omega pose 后，系统一致性能恢复多少。由于 Omega 看过 target RGB，并且 target GT pose 参与 Sim(3) 对齐，P2 只能称为“全部替换外参诊断”，不能称为严格 pose-free NVS。
 
 ## 7. 完整指标
 
 | 实验 | PSNR | SSIM | Occupied PSNR | Dynamic PSNR | Dynamic SSIM | Depth RMSE | Dynamic Depth RMSE |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| E0 | 24.190 | 0.8163 | 24.167 | 18.820 | 0.5441 | 3.603 m | 5.470 m |
-| E1 | 17.837 | 0.3639 | 17.883 | 16.527 | 0.2543 | 7.448 m | 8.080 m |
-| E2 | 22.433 | 0.7311 | 22.402 | 18.570 | 0.4995 | 4.011 m | 5.625 m |
+| P0 | 24.190 | 0.8163 | 24.167 | 18.820 | 0.5441 | 3.603 m | 5.470 m |
+| P1 | 17.837 | 0.3639 | 17.883 | 16.527 | 0.2543 | 7.448 m | 8.080 m |
+| P2 | 22.433 | 0.7311 | 22.402 | 18.570 | 0.4995 | 4.011 m | 5.625 m |
 
 Omega pose 诊断：
 
@@ -217,9 +218,9 @@ Omega pose 诊断：
 
 ## 8. 结果解释
 
-E1 中，UFO 根据 Omega context pose 把图像内容放入 3D 世界，却从 GT target pose 渲染。几厘米和约 1.4 度的误差足以造成建筑边缘、纹理和物体轮廓的像素错位。这个 UFO 又是在 scene621 上单场景拟合的，对 pose 很敏感，因此下降 6.35 dB。
+P1 中，UFO 根据 Omega context pose 把图像内容放入 3D 世界，却从 GT target pose 渲染。几厘米和约 1.4 度的误差足以造成建筑边缘、纹理和物体轮廓的像素错位。这个 UFO 又是在 scene621 上单场景拟合的，对 pose 很敏感，因此下降 6.35 dB。
 
-E2 中，建场景和渲染都使用同一次 Omega 推理的 pose。整套坐标仍有误差，但 context 和 target 的误差更一致，因此恢复了 E1 损失中的大部分，只比 E0 低 1.76 dB。
+P2 中，建场景和渲染都使用同一次 Omega 推理的 pose。整套坐标仍有误差，但 context 和 target 的误差更一致，因此恢复了 P1 损失中的大部分，只比 P0 低 1.76 dB。
 
 当前最稳妥的结论是：
 
@@ -229,7 +230,7 @@ E2 中，建场景和渲染都使用同一次 Omega 推理的 pose。整套坐�
 
 - 目前只有一个训练场景；短窗口和整段长序列结果都属于 scene621 场景内拟合；
 - UFO 在 scene621 上训练并在 scene621 上评估，是场景内拟合实验；
-- E2 使用了 target RGB 和 target GT Sim(3)，不是严格未知目标视角；
+- P2 以及最终矩阵的 E1/E3 使用了 target RGB 和 target GT Sim(3)，不是严格未知目标视角；
 - 当前只替换外参，仍使用 Waymo GT 内参；
 - 正式结论需要多个窗口、多个场景的均值和方差。
 
@@ -259,13 +260,13 @@ outputs/scene621_group_meeting/
 
 三条视频仍然只有模型 render，横向顺序为 camera 1 / camera 0 / camera 2（左前 / 正前 / 右前），没有 GT、标签或说明文字。规格统一为 198 帧、19.8 秒、10 FPS、720 x 160。
 
-| 长序列实验 | PSNR | SSIM | Dynamic PSNR | 相对 E0 PSNR |
+| 长序列外参诊断 | PSNR | SSIM | Dynamic PSNR | 相对 P0 PSNR |
 | --- | ---: | ---: | ---: | ---: |
-| E0 GT context + GT render pose | 24.48 | 0.7805 | 19.83 | 0.00 |
-| E1 Omega context + GT render pose | 18.10 | 0.3677 | 17.13 | -6.38 |
-| E2 Omega context + Omega render pose | 22.59 | 0.7014 | 19.45 | -1.88 |
+| P0 GT context + GT render pose | 24.48 | 0.7805 | 19.83 | 0.00 |
+| P1 Omega context + GT render pose | 18.10 | 0.3677 | 17.13 | -6.38 |
+| P2 Omega context + Omega render pose | 22.59 | 0.7014 | 19.45 | -1.88 |
 
-长序列还暴露出一个短视频看不到的现象：E0 在 frame 80--139 的窗口约为 26--27 dB，但 frame 160 以后约为 21 dB。说明 scene621 单场景训练 10k 后，不同时间段的拟合质量仍不均匀。
+长序列还暴露出一个短视频看不到的现象：P0 在 frame 80--139 的窗口约为 26--27 dB，但 frame 160 以后约为 21 dB。说明 scene621 单场景训练 10k 后，不同时间段的拟合质量仍不均匀。
 
 长序列展示目录：
 
@@ -282,3 +283,33 @@ outputs/scene621_group_meeting/long_sequence/
 ```
 
 每个 `metrics.json` 同时包含整段汇总和 10 个窗口的分段指标；每个 `frame_mapping.json` 记录视频帧到原始 scene frame 的逐帧映射。
+
+## 12. 最终四组 T/K 标定矩阵
+
+最终实验把外参 T 和内参 K 作为两个独立变量。四组都使用同一个 scene621 10k checkpoint、同样的 198 帧滑窗协议；Omega 组使用 all-frame 输出。
+
+Omega 在 416 x 624 图像上解码 K，而 UFO 使用 160 x 240。适配代码按每张图真实执行的中心裁剪、resize 和 padding，把 K 先逆变换回磁盘图像 320 x 480，再映射到 UFO 160 x 240。scene621 没有实际裁剪或 padding，最终主点从 Omega 的 `(312, 208)` 变为 UFO 的 `(120, 80)`。
+
+全序列 Omega K 相对 Waymo GT 的平均误差为：焦距 7.21%，FoV 2.60 度，主点 2.81 px。Omega 主点固定在图像中心，并不代表它预测了任意主点。
+
+| 实验 | 外参 T | 内参 K | PSNR | Delta PSNR | SSIM | Dynamic PSNR |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| E0 | GT | GT | 24.478 | 0.000 | 0.7805 | 19.834 |
+| E1 | Omega | GT | 22.594 | -1.884 | 0.7014 | 19.449 |
+| E2 | GT | Omega | 23.542 | -0.935 | 0.7438 | 19.604 |
+| E3 | Omega | Omega | 23.504 | -0.973 | 0.7354 | 19.624 |
+
+核心结论：外参误差单独影响更大；但 T/K 误差不是简单相加。E3 比 E1 高 0.91 dB，表明 Omega 自己输出的外参与内参配套使用时，比 Omega 外参混用 GT 内参更一致。当前可以说“GT 相机标定可被基本替换”，但必须同时说明仍使用 GT Sim(3) 对齐，且 all-frame Omega 看过 target RGB。
+
+最终四组文件统一放在：
+
+```text
+outputs/scene621_group_meeting/long_sequence/camera_matrix/
+├── camera_matrix_metrics.csv
+├── camera_matrix_metrics.json
+├── E0_E1_E2_E3_camera_matrix_render_only.mp4
+├── E0_GT_T_GT_K/E0_GT_T_GT_K_render_3cam.mp4
+├── E1_Omega_T_GT_K/E1_Omega_T_GT_K_render_3cam.mp4
+├── E2_GT_T_Omega_K/E2_GT_T_Omega_K_render_3cam.mp4
+└── E3_Omega_T_Omega_K/E3_Omega_T_Omega_K_render_3cam.mp4
+```

@@ -84,6 +84,10 @@ def get_args_parser():
                         help="Root containing <scene_name>/omega_pose_override.npz")
     parser.add_argument("--pose_override_mode", choices=("none", "context", "all"),
                         default="none")
+    parser.add_argument("--intrinsics_override_dir", type=str, default=None,
+                        help="Root containing Omega intrinsics in the pose override NPZ")
+    parser.add_argument("--intrinsics_override_mode", choices=("none", "context", "all"),
+                        default="none")
 
     # Model parameters (defaults from config.json, CLI overrides)
     parser.add_argument("--model", default="UFO-B/8", type=str)

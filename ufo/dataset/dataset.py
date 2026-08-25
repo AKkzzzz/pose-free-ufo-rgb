@@ -135,6 +135,20 @@ class UFODataset(Dataset):
         self.pose_override_store = (
             PoseOverrideStore(pose_override_dir) if self.pose_override_mode != "none" else None
         )
+        self.intrinsics_override_mode = getattr(args, "intrinsics_override_mode", "none")
+        intrinsics_override_dir = getattr(args, "intrinsics_override_dir", None)
+        if self.intrinsics_override_mode not in ("none", "context", "all"):
+            raise ValueError(
+                f"invalid intrinsics_override_mode={self.intrinsics_override_mode!r}"
+            )
+        if self.intrinsics_override_mode != "none" and not intrinsics_override_dir:
+            raise ValueError(
+                "intrinsics_override_dir is required when intrinsics override is enabled"
+            )
+        self.intrinsics_override_store = (
+            PoseOverrideStore(intrinsics_override_dir)
+            if self.intrinsics_override_mode != "none" else None
+        )
         if isinstance(annotation_txt_file_list, str):
             annotation_txt_file_list = [annotation_txt_file_list]
         scene_list = []
@@ -177,6 +191,21 @@ class UFODataset(Dataset):
                 scene_json["scene_name"], frame_idx, camera
             )
         return np.asarray(scene_json["camera_to_world"][camera][frame_idx], dtype=np.float64)
+
+    def _camera_intrinsics(self, scene_json, camera, frame_idx, role):
+        use_override = self.intrinsics_override_store is not None and (
+            role == "context" or (role == "target" and self.intrinsics_override_mode == "all")
+        )
+        if use_override:
+            return self.intrinsics_override_store.get_intrinsics(
+                scene_json["scene_name"], frame_idx, camera
+            )
+        fx, fy, cx, cy = np.asarray(scene_json["normalized_intrinsics"][camera])
+        return np.asarray([
+            [fx * self.target_size[1], 0.0, cx * self.target_size[1]],
+            [0.0, fy * self.target_size[0], cy * self.target_size[0]],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
 
     def __len__(self) -> int:
         return len(self.annotations)
@@ -249,7 +278,6 @@ class UFODataset(Dataset):
         pose_role: str = "context",
     ) -> Dict[str, Any]:
         """Retrieve a single frame from the dataset."""
-        normalized_intrinsics = scene_json["normalized_intrinsics"]
         dataset_name = scene_json["dataset"]
 
         images, depths, sky_masks, flows = [], [], [], []
@@ -350,20 +378,9 @@ class UFODataset(Dataset):
             camtoworlds_global.append(camtoworld_global)
 
             # intrinsics
-            fx, fy, cx, cy = np.array(normalized_intrinsics[camera])
-            fx = fx * self.target_size[1]
-            fy = fy * self.target_size[0]
-            cx = cx * self.target_size[1]
-            cy = cy * self.target_size[0]
-            intrinsics.append(
-                torch.tensor(
-                    [
-                        [fx, 0.0, cx],
-                        [0.0, fy, cy],
-                        [0.0, 0.0, 1.0],
-                    ]
-                ).float()
-            )
+            intrinsics.append(torch.tensor(self._camera_intrinsics(
+                scene_json, camera, frame_idx, pose_role
+            )).float())
 
             if self.load_depth or self.load_flow:
                 if dataset_name == "waymo":

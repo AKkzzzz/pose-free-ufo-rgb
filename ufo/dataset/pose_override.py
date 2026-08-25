@@ -10,6 +10,7 @@ class PoseOverrideStore:
         self.root = Path(root)
         self._scene_name = None
         self._poses = None
+        self._intrinsics = None
 
     def _load(self, scene_name):
         path = self.root / scene_name / "omega_pose_override.npz"
@@ -24,8 +25,14 @@ class PoseOverrideStore:
             frame_ids = payload["frame_ids"].astype(np.int64)
             camera_ids = payload["camera_ids"].astype(str)
             poses = payload["omega_camera_to_world_aligned"].astype(np.float64)
+            intrinsics = (
+                payload["predicted_intrinsics_ufo"].astype(np.float64)
+                if "predicted_intrinsics_ufo" in payload else None
+            )
         if poses.shape != (len(frame_ids), 4, 4):
             raise ValueError(f"invalid pose override shape {poses.shape} in {path}")
+        if intrinsics is not None and intrinsics.shape != (len(frame_ids), 3, 3):
+            raise ValueError(f"invalid intrinsics override shape {intrinsics.shape} in {path}")
         mapping = {}
         for frame_id, camera_id, pose in zip(frame_ids, camera_ids, poses):
             key = (int(frame_id), str(camera_id))
@@ -34,6 +41,10 @@ class PoseOverrideStore:
             mapping[key] = pose
         self._scene_name = scene_name
         self._poses = mapping
+        self._intrinsics = None if intrinsics is None else {
+            (int(frame_id), str(camera_id)): intrinsic
+            for frame_id, camera_id, intrinsic in zip(frame_ids, camera_ids, intrinsics)
+        }
 
     def get(self, scene_name, frame_id, camera_id):
         if self._scene_name != scene_name:
@@ -44,4 +55,20 @@ class PoseOverrideStore:
         except KeyError as error:
             raise KeyError(
                 f"pose override for scene={scene_name} frame={frame_id} camera={camera_id} is missing"
+            ) from error
+
+    def get_intrinsics(self, scene_name, frame_id, camera_id):
+        if self._scene_name != scene_name:
+            self._load(scene_name)
+        if self._intrinsics is None:
+            raise KeyError(
+                f"intrinsics override is absent for scene={scene_name}; regenerate the Omega NPZ"
+            )
+        key = (int(frame_id), str(camera_id))
+        try:
+            return self._intrinsics[key]
+        except KeyError as error:
+            raise KeyError(
+                f"intrinsics override for scene={scene_name} frame={frame_id} "
+                f"camera={camera_id} is missing"
             ) from error

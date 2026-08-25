@@ -37,6 +37,10 @@ def build_args():
         "--pose_override_sequence_dir", type=str, default=None,
         help="Root containing start_NNN/<scene_name>/omega_pose_override.npz",
     )
+    parser.add_argument(
+        "--intrinsics_override_sequence_dir", type=str, default=None,
+        help="Root containing per-window Omega intrinsics override NPZ files",
+    )
     parser.add_argument("--video_name", default="scene621_long_render_3cam.mp4")
     args = merge_config_and_args(parser, config_path=None)
     args = merge_config_and_args(parser, config_path=args.config)
@@ -47,6 +51,15 @@ def build_args():
             parser.error("--pose_override_sequence_dir is required for pose overrides")
         args.pose_override_dir = str(
             Path(args.pose_override_sequence_dir) / f"start_{args.start_indices[0]:03d}"
+        )
+    if args.intrinsics_override_mode != "none":
+        if not args.intrinsics_override_sequence_dir:
+            parser.error(
+                "--intrinsics_override_sequence_dir is required for intrinsics overrides"
+            )
+        args.intrinsics_override_dir = str(
+            Path(args.intrinsics_override_sequence_dir)
+            / f"start_{args.start_indices[0]:03d}"
         )
     return args
 
@@ -117,6 +130,12 @@ def main():
             if args.pose_override_mode != "none":
                 root = Path(args.pose_override_sequence_dir) / f"start_{start_index:03d}"
                 dataset.pose_override_store = PoseOverrideStore(root)
+            if args.intrinsics_override_mode != "none":
+                root = (
+                    Path(args.intrinsics_override_sequence_dir)
+                    / f"start_{start_index:03d}"
+                )
+                dataset.intrinsics_override_store = PoseOverrideStore(root)
             args.start_idx = start_index
             LOGGER.info("Rendering window start=%d", start_index)
             pred, target, input_dict, _ = ufo_inference.run_inference(
@@ -158,6 +177,8 @@ def main():
         "video": str(output_path.resolve()),
         "pose_override_mode": args.pose_override_mode,
         "pose_override_sequence_dir": args.pose_override_sequence_dir,
+        "intrinsics_override_mode": args.intrinsics_override_mode,
+        "intrinsics_override_sequence_dir": args.intrinsics_override_sequence_dir,
         "scene_frames": scene_frames,
         "rendered_frames": len(mapping),
         "fps": fps,

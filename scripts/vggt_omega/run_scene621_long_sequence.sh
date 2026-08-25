@@ -11,7 +11,6 @@ CHECKPOINT="${UFO_CHECKPOINT:-${UFO_ROOT}/outputs/scene621_10k/ufo_scene621_from
 OMEGA_CHECKPOINT="${OMEGA_CHECKPOINT:-${OMEGA_ROOT}/checkpoints/vggt_omega_1b_512.pt}"
 OUTPUT_ROOT="${UFO_LONG_OUTPUT_ROOT:-${UFO_ROOT}/outputs/scene621_group_meeting/long_sequence}"
 MANIFEST_ROOT="${OUTPUT_ROOT}/manifests"
-CONTEXT_POSES="${OUTPUT_ROOT}/omega_context"
 ALL_POSES="${OUTPUT_ROOT}/omega_all"
 STARTS=(0 20 40 60 80 100 120 140 160 178)
 
@@ -30,9 +29,6 @@ done
 cd "${OMEGA_ROOT}"
 "${OMEGA_PYTHON_BIN}" tools/export_ufo_pose_sequence.py \
     --manifests "${manifests[@]}" --checkpoint "${OMEGA_CHECKPOINT}" \
-    --output-dir "${CONTEXT_POSES}" --scope context
-"${OMEGA_PYTHON_BIN}" tools/export_ufo_pose_sequence.py \
-    --manifests "${manifests[@]}" --checkpoint "${OMEGA_CHECKPOINT}" \
     --output-dir "${ALL_POSES}" --scope all
 
 render_long() {
@@ -47,8 +43,14 @@ render_long() {
         --video_name "${video_name}" "$@"
 }
 
-render_long E0_GT E0_GT_full_scene_render_3cam.mp4 --pose_override_mode none
-render_long E1_Omega_context E1_Omega_context_full_scene_render_3cam.mp4 \
-    --pose_override_mode context --pose_override_sequence_dir "${CONTEXT_POSES}"
-render_long E2_Omega_all E2_Omega_all_full_scene_render_3cam.mp4 \
-    --pose_override_mode all --pose_override_sequence_dir "${ALL_POSES}"
+render_long "camera_matrix/E0_GT_T_GT_K" E0_GT_T_GT_K_render_3cam.mp4 \
+    --pose_override_mode none --intrinsics_override_mode none
+render_long "camera_matrix/E1_Omega_T_GT_K" E1_Omega_T_GT_K_render_3cam.mp4 \
+    --pose_override_mode all --pose_override_sequence_dir "${ALL_POSES}" \
+    --intrinsics_override_mode none
+render_long "camera_matrix/E2_GT_T_Omega_K" E2_GT_T_Omega_K_render_3cam.mp4 \
+    --pose_override_mode none --intrinsics_override_mode all \
+    --intrinsics_override_sequence_dir "${ALL_POSES}"
+render_long "camera_matrix/E3_Omega_T_Omega_K" E3_Omega_T_Omega_K_render_3cam.mp4 \
+    --pose_override_mode all --pose_override_sequence_dir "${ALL_POSES}" \
+    --intrinsics_override_mode all --intrinsics_override_sequence_dir "${ALL_POSES}"
