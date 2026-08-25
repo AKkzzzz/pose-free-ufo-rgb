@@ -180,8 +180,8 @@ def points_in_boxes_probability(points, boxes, valid_mask, temperature=0.1, back
     return probs
 
 
-def points_to_oriented_boxes_distance(points, boxes, valid_mask):
-    """Return each point's metric distance to the nearest valid oriented box."""
+def points_to_oriented_boxes_distance_per_box(points, boxes, valid_mask):
+    """Return each point's metric distance to every valid oriented box."""
     centers = boxes.mean(dim=2)
     edge_x = boxes[:, :, 1] - boxes[:, :, 0]
     edge_y = boxes[:, :, 2] - boxes[:, :, 0]
@@ -198,8 +198,43 @@ def points_to_oriented_boxes_distance(points, boxes, valid_mask):
     local = torch.einsum("bmij,bnmj->bnmi", axes, relative)
     outside = (local.abs() - extents[:, None]).clamp_min(0)
     distance = outside.norm(dim=-1)
-    distance = distance.masked_fill(~valid_mask.bool()[:, None], float("inf"))
-    return distance.amin(dim=-1)
+    return distance.masked_fill(~valid_mask.bool()[:, None], float("inf"))
+
+
+def points_to_oriented_boxes_distance(points, boxes, valid_mask):
+    """Return each point's metric distance to the nearest valid oriented box."""
+    return points_to_oriented_boxes_distance_per_box(
+        points, boxes, valid_mask
+    ).amin(dim=-1)
+
+
+def gaussian_bbox_geometry_gate(points, boxes, valid_mask, margin):
+    """Build a per-Gaussian gate that is one inside a bbox and decays outside."""
+    if margin < 0:
+        raise ValueError(f"geometry gate margin must be non-negative, got {margin}")
+    distance = points_to_oriented_boxes_distance_per_box(points, boxes, valid_mask)
+    if margin == 0:
+        gate = (distance <= 1e-6).to(points.dtype)
+    else:
+        gate = torch.exp(-distance / margin)
+    return gate.masked_fill(~valid_mask.bool()[:, None], 0.0)
+
+
+def gate_object_assignments(token_weights, geometry_gate):
+    """Gate object mass and return rejected mass to background."""
+    if token_weights.shape[:-1] != geometry_gate.shape[:-1]:
+        raise ValueError(
+            "token weights and geometry gate must describe the same Gaussians"
+        )
+    if token_weights.shape[-1] != geometry_gate.shape[-1] + 1:
+        raise ValueError("geometry gate must have one entry per non-background class")
+    gate = geometry_gate.to(token_weights).clamp(0.0, 1.0)
+    raw_objects = token_weights[..., 1:]
+    gated_objects = raw_objects * gate
+    gated_background = token_weights[..., :1] + (
+        raw_objects - gated_objects
+    ).sum(dim=-1, keepdim=True)
+    return torch.cat([gated_background, gated_objects], dim=-1)
 
 
 def gaussian_labels_to_token_labels(
@@ -2115,6 +2150,52 @@ class UFO(ViT):
                 data_dict['bbox_token_weights'] = torch.stack(
                     token_weights, dim=1
                 ).reshape(b, -1, 1 + self.num_bbox)
+            elif getattr(self.args, "object_assignment_geometry_gate", False):
+                b, t, v, h, w, _ = gs_params["means"].shape
+                token_weights = rearrange(
+                    data_dict['bbox_token_weights'], "b (t n) k -> b t n k", t=t
+                )
+                raw_weights = expand_spatial_token_assignments(
+                    token_weights, v, h, w, self.unpatch_size
+                )
+                gaussian_means = rearrange(
+                    gs_params["means"], "b t v h w c -> b t (v h w) c"
+                ).detach().float()
+                gated_weights = []
+                gate_support = []
+                with torch.no_grad():
+                    for time_index in range(t):
+                        geometry_gate = gaussian_bbox_geometry_gate(
+                            gaussian_means[:, time_index],
+                            data_dict['context_instances_corner'][:, time_index].float(),
+                            data_dict['context_instances_id'][:, time_index],
+                            margin=self.args.object_geometry_gate_margin,
+                        )
+                        gated_weights.append(gate_object_assignments(
+                            rearrange(
+                                raw_weights[:, time_index],
+                                "b v h w k -> b (v h w) k",
+                            ).float(),
+                            geometry_gate,
+                        ).to(raw_weights.dtype))
+                        gate_support.append(geometry_gate.amax(dim=-1) > 0.5)
+                gated_weights = rearrange(
+                    torch.stack(gated_weights, dim=1),
+                    "b t (v h w) k -> b t v h w k", v=v, h=h, w=w,
+                )
+                data_dict['object_raw_gaussian_dynamic_mass'] = (
+                    1.0 - raw_weights[..., 0].float()
+                ).mean()
+                data_dict['object_gated_gaussian_dynamic_mass'] = (
+                    1.0 - gated_weights[..., 0].float()
+                ).mean()
+                data_dict['object_gated_hard_dynamic_ratio'] = (
+                    gated_weights.argmax(dim=-1) > 0
+                ).float().mean()
+                data_dict['object_geometry_gate_support_ratio'] = torch.stack(
+                    gate_support, dim=1
+                ).float().mean()
+                data_dict['bbox_weights'] = gated_weights
 
         
         data_dict['gs_params'] = gs_params

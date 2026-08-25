@@ -316,6 +316,14 @@ def get_args_parser():
         help="Select the geometry used to construct token-level object labels.",
     )
     parser.add_argument("--object_gaussian_coverage_threshold", type=float, default=0.1)
+    parser.add_argument(
+        "--object_assignment_geometry_gate", action="store_true",
+        help="Gate broadcast token ownership using current Gaussian-to-bbox geometry.",
+    )
+    parser.add_argument(
+        "--object_geometry_gate_margin", type=float, default=0.5,
+        help="Metric falloff margin outside each oriented bbox; zero gives a hard inside gate.",
+    )
     parser.add_argument("--training_sampling_mode", choices=["uniform", "dynamic_mixture"], default="uniform")
     parser.add_argument("--dynamic_rich_pool", type=str, default=None)
     parser.add_argument("--dynamic_sampling_ratio", type=float, default=0.0)
