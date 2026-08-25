@@ -313,3 +313,46 @@ outputs/scene621_group_meeting/long_sequence/camera_matrix/
 ├── E2_GT_T_Omega_K/E2_GT_T_Omega_K_render_3cam.mp4
 └── E3_Omega_T_Omega_K/E3_Omega_T_Omega_K_render_3cam.mp4
 ```
+
+## 13. 动态物体不动的 D0 / D1 定位实验
+
+长视频中车辆在一个 20 帧窗口内近似静止、到下一个窗口突然跳到新位置。为区分长视频 target pose 复用错误和 object assignment collapse，固定同一个 scene621 10k checkpoint，增加两个只在 inference 生效的诊断模式：
+
+```text
+D0 predicted：使用 checkpoint 原本预测的 bbox assignment
+D1 oracle_bbox：最终 Gaussian 中心落在 GT 3D bbox 内时，硬分配给该物体；否则分配为背景
+```
+
+D1 不改网络、不训练，也不使用 LiDAR。它仍使用原版 `context_instances_pose -> target_instances_pose` 搬运 Gaussian，只把 assignment 换成 GT bbox 几何 Oracle。长序列实现会先取完整 20 帧都有效的物体槽位，并在最终 scene token 更新和 Gaussian 重解码之后重新判框，避免缺失槽位的 identity pose 和陈旧 assignment 污染结果。
+
+| Window | 模式 | Target pose 相邻帧平移 | 背景概率 | 硬动态比例 | Gaussian 平均位移 | PSNR | Dynamic PSNR |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0--19 | D0 predicted | 0.236 m | 0.999985 | 0.000% | 0.000029 m | 24.125 | 18.743 |
+| 0--19 | D1 Oracle | 0.236 m | 0.996495 | 0.350% | 0.005532 m | 24.272 | 18.932 |
+| 140--159 | D0 predicted | 0.153 m | 0.999544 | 0.000% | 0.000860 m | 23.449 | 18.820 |
+| 140--159 | D1 Oracle | 0.153 m | 0.988231 | 1.177% | 0.006919 m | 23.833 | 19.420 |
+
+判断属于情况 B，而不是长视频 target pose repeat：两个窗口的 GT object pose 都逐帧变化，但 D0 硬 assignment 全为背景，最终 Gaussian 基本不动。D1 在 start=140 上使 PSNR 提升 0.384 dB、Dynamic PSNR 提升 0.601 dB，并产生合理的逐帧物体位移，因此 object assignment 是当前动态链路的第一故障点。
+
+进一步检查发现一个比 token 粒度更直接的训练监督问题：`gs_token_means` 在当前窗口的 local canonical 坐标中计算，但现有 `points_in_boxes_probability()` 使用 global canonical 的 `context_instances_corner` 生成 GT label。scene621 的统计因此出现 `object_dynamic_gt_count=0`，训练目标本身就是全背景。正确的同坐标输入是代码中已经存在的 `context_instances_corner_local`。本轮只用它构造 inference Oracle，尚未修改训练目标，也没有重训 checkpoint。
+
+Oracle 几何自检通过：start=0 被分配 Gaussian 到 bbox 中心的最大距离为 5.37 m，所涉 bbox 最大半对角线为 5.61 m；object pose 旋转正交误差最大为 `1.8e-7`。这排除了早期调试中 identity slot 导致的百米假位移。
+
+诊断文件位于：
+
+```text
+outputs/scene621_group_meeting/dynamic_assignment_diagnostic/
+├── dynamic_assignment_summary.csv
+├── start_000/
+│   ├── dynamic_assignment_comparison.json
+│   ├── D_predicted_start_000_render_3cam.mp4
+│   ├── D_oracle_bbox_start_000_render_3cam.mp4
+│   └── D0_predicted_top_D1_oracle_bottom_start_000_render_3cam.mp4
+└── start_140/
+    ├── dynamic_assignment_comparison.json
+    ├── D_predicted_start_140_render_3cam.mp4
+    ├── D_oracle_bbox_start_140_render_3cam.mp4
+    └── D0_predicted_top_D1_oracle_bottom_start_140_render_3cam.mp4
+```
+
+对照视频仍是纯 render：上半部分为 D0，下半部分为 D1；每一行横向排列 camera 1 / camera 0 / camera 2，没有 GT 或文字覆盖。

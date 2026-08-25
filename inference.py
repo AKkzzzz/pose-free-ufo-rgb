@@ -88,6 +88,11 @@ def get_args_parser():
                         help="Root containing Omega intrinsics in the pose override NPZ")
     parser.add_argument("--intrinsics_override_mode", choices=("none", "context", "all"),
                         default="none")
+    parser.add_argument(
+        "--inference_assignment_mode", choices=("predicted", "oracle_bbox"),
+        default="predicted",
+        help="Use predicted assignment or a hard GT-box oracle during eval",
+    )
 
     # Model parameters (defaults from config.json, CLI overrides)
     parser.add_argument("--model", default="UFO-B/8", type=str)
@@ -258,6 +263,13 @@ def run_inference(model, dataset, args, device):
     inout_dicts = prepare_inputs_and_targets(
         data_dict, device, timespan=args.timespan, from_list=True, args=args
     )
+    if getattr(args, "inference_assignment_mode", "predicted") == "oracle_bbox":
+        full_target_valid = torch.cat(
+            [input_dict["target_instances_id"] for input_dict, _ in inout_dicts],
+            dim=1,
+        ).bool().all(dim=1)
+        for input_dict, _ in inout_dicts:
+            input_dict["oracle_target_valid_throughout"] = full_target_valid
     num_chunks = len(inout_dicts)
     logger.info(f"Scene {args.scene_id} (start_idx={args.start_idx}): {num_chunks} chunks")
 
