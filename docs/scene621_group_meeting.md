@@ -427,6 +427,18 @@ outputs/scene621_group_meeting/dynamic_assignment_r15/
 
 三行对照视频均为纯 render：上行为 R0，中行为 R1，下行为 R1.5；每行横向排列三个相机，没有 GT 或文字覆盖。
 
+为避免两个窗口不足以代表整段场景，最终还按与原长序列 E0 完全相同的 10 个窗口生成 scene621 全部 198 帧。R1.5 长序列 PSNR 为 23.840 dB、Dynamic PSNR 为 19.773 dB；R0 分别为 24.478 dB、19.834 dB，因此 R1.5 整段仍低 0.638 dB、0.061 dB。它支持同一个结论：错误背景运动已被约束，但 conservative gate 的 recall 损失尚未转化成全序列净收益。
+
+```text
+outputs/scene621_group_meeting/dynamic_assignment_r15/long_sequence/
+├── metrics.json
+├── frame_mapping.json
+├── R15_full_scene_render_3cam.mp4
+└── R0_top_R15_bottom_full_scene_render_3cam.mp4
+```
+
+两个长视频均严格覆盖 frame 0--197、198 帧、10 FPS、19.8 秒。R1.5 单独视频为 720 x 160；对照视频为 720 x 320，上 R0、下 R1.5，仍为三摄像头纯 render。
+
 ```text
 config: configs/experiments/ufo_scene621_r1_gaussian_coverage_resume10k_2k_4090.json
 output: outputs/scene621_assignment_r1/gaussian_coverage_resume10k_2k/
