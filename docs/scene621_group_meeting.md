@@ -439,6 +439,49 @@ outputs/scene621_group_meeting/dynamic_assignment_r15/long_sequence/
 
 两个长视频均严格覆盖 frame 0--197、198 帧、10 FPS、19.8 秒。R1.5 单独视频为 720 x 160；对照视频为 720 x 320，上 R0、下 R1.5，仍为三摄像头纯 render。
 
+### R2 scratch 10k：联合训练 geometry-gated ownership
+
+R1 和 R1.5 都是在已经 background collapse 的 R0 10k checkpoint 上短暂微调。为排除错误局部最优的影响，R2 使用与 R0 相同的 scene621 数据和 10,000 optimizer steps，从随机初始化重新训练完整网络。相对 R0 只保留两项机制修改：训练监督由 Gaussian coverage 聚合成 token GT，推理运动使用 token probability 乘以每次最终 decode 后重算的 Gaussian--bbox geometry gate。没有加入 soft gate，也没有改成 Gaussian-level prediction head。
+
+训练在 RTX 4090 上完成，最终 checkpoint 为 `ckpt_009999.pth`，峰值显存 24,139 MiB。scratch 的动态学习启动较晚：约 1.8k 后首次出现动态 GT，约 2.6k 后 assignment 开始输出前景；训练 batch 后期 Gaussian precision 多数为 60--90%，recall 随窗口动态目标密度在约 15--70% 间波动，最大位移通常保持在 1--5 m，没有再出现 R1 的 40--47 m 级背景误搬运。
+
+| Window | 模型 | PSNR | Dynamic PSNR | Gaussian recall | Gaussian precision | 最大位移 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 0--19 | R0 10k | 24.125 | 18.743 | -- | -- | 0.020 m |
+| 0--19 | R1.5 +1k | 23.518 | 18.674 | 29.83% | 80.05% | 6.232 m |
+| 0--19 | R2 scratch 10k | 23.201 | 18.673 | 21.06% | 86.57% | 7.821 m |
+| 140--159 | R0 10k | 23.449 | 18.820 | -- | -- | 1.367 m |
+| 140--159 | R1.5 +1k | 23.373 | 18.985 | 61.00% | 78.98% | 5.415 m |
+| 140--159 | R2 scratch 10k | 23.220 | 19.019 | 64.87% | 79.44% | 5.400 m |
+
+固定窗口表明，scratch 确实能自行学出高 precision ownership。start=140 的 Dynamic PSNR 比 R0 高 0.199 dB，也略高于 R1.5 0.034 dB；但 start=0 没有收益，而且两个窗口总 PSNR 都下降。因此不能从局部窗口声称 R2 已经解决动态链。
+
+198 帧 full-scene 的最终结果是：R2 `23.514 / 19.806 dB`，R0 `24.478 / 19.834 dB`，R1.5 `23.840 / 19.773 dB`。R2 相对 R0 总 PSNR 下降 0.964 dB、Dynamic PSNR 下降 0.028 dB；相对 R1.5 则是总 PSNR 下降 0.326 dB、Dynamic PSNR 上升 0.034 dB。这个量级不能视为最终性能收益。
+
+所以当前最严谨的结论是：**Token-to-Gaussian Dynamic Ownership Refinement 的 geometry gate 已被两种初始化共同验证能抑制粗粒度 ownership 污染；scratch 训练也能形成高 precision assignment，但 recall 和重建质量的联合优化仍未解决。R2 仍是机制验证，不是最终新增算法。** 下一步不应只延长同一配置训练，而应先处理 assignment loss 与 scene reconstruction 的优化竞争，以及跨窗口正样本密度不均衡。
+
+```text
+config: configs/experiments/ufo_scene621_r2_geometry_gate_scratch10k_4090.json
+checkpoint: outputs/scene621_assignment_r2/geometry_gate_scratch10k/checkpoints/ckpt_009999.pth
+
+outputs/scene621_group_meeting/dynamic_assignment_r2/
+├── r2_summary.csv
+├── r2_summary.json
+├── ckpt_010k/start_000/
+│   ├── dynamic_assignment_comparison.json
+│   └── D_predicted_start_000_render_3cam.mp4
+├── ckpt_010k/start_140/
+│   ├── dynamic_assignment_comparison.json
+│   └── D_predicted_start_140_render_3cam.mp4
+└── long_sequence/
+    ├── metrics.json
+    ├── frame_mapping.json
+    ├── R2_full_scene_render_3cam.mp4
+    └── R0_top_R2_bottom_full_scene_render_3cam.mp4
+```
+
+两段长视频均覆盖 frame 0--197、198 帧、10 FPS、19.8 秒。R2 单独视频为 720 x 160；对照视频为 720 x 320，上 R0、下 R2。两者都只包含 front-left、front、front-right 三相机 render，没有 GT、指标文字或使用说明覆盖。
+
 ```text
 config: configs/experiments/ufo_scene621_r1_gaussian_coverage_resume10k_2k_4090.json
 output: outputs/scene621_assignment_r1/gaussian_coverage_resume10k_2k/
