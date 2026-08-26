@@ -505,34 +505,46 @@ window scale = median(all pair/time ratios)
 | 前--右 | 0.0854 m | 0.0477 m | 0.0404 m |
 | 左--右 | 0.1858 m | 0.18579 m | 0.0060 m |
 
-因此 robust median scale 实际主要锚住了最长、最稳定的左--右 pair，不能把另外两个 camera center 同时投影回真实 rig。表中的 200 个观测来自 10 个 20-frame Omega window；末窗口与前一窗口按现有长序列协议有 2 帧输入重叠，render 汇总仍按 frame id 去重为 198 帧。
+因此 robust median scale 实际主要锚住了最长、最稳定的左--右 pair，不能把另外两个 camera center 同时投影回真实 rig。这是后续固定-rig projection 需要解决的问题，但 P2.1 已证明它不是旧 P2 下降 4 dB 的主要原因。表中的 200 个观测来自 10 个 20-frame Omega window；末窗口与前一窗口按现有长序列协议有 2 帧输入重叠，render 汇总仍按 frame id 去重为 198 帧。
 
 ### 14.2 UFO local-pose-free 输入路径
 
 原 Dataset 的 `world_to_canonical_global` 会回退读取 GT camera pose，object instance 又位于 Waymo world。新路径作了两项强制隔离：
 
-1. `context_camtoworlds`、`context_camtoworlds_global`、`target_camtoworlds` 和 `target_camtoworlds_global` 全部直接来自同一个 rig-local metric override；缺失或坐标类型不符立即报错，不允许 GT fallback。
+1. `context_camtoworlds`、`context_camtoworlds_global`、`target_camtoworlds` 和 `target_camtoworlds_global` 全部从同一个 rig-local metric override 计算；缺失或坐标类型不符立即报错，不允许 GT fallback。
 2. pose-free camera-only 模式不加载 instance world pose，所有 instance id 为 0，bbox dynamic transform 等价于 identity。Dynamic PSNR 因此只作参考，正式结论看 full/static RGB 与 depth。
 
-自动 contract check 会检查 manifest/NPZ 不含 GT camera trajectory 或 Sim3 字段、front0 为单位阵、baseline 与尺度统计。它还会在内存中删除 annotation 的 `camera_to_world/ego_pose/ego_to_world` 后实际执行 Dataset；当前 4 个 chunk 全部通过，local/global camera matrices 完全一致，object ids 全为 0。
+旧 P2 错误地把 local/global canonicalization 都设为单位阵，导致二者完全相同，`update_scene()` 得到的 `scene_from_local` 也恒为单位阵。P2.1 恢复 UFO 原本的双坐标 contract：
 
-### 14.3 P0/P1/P2 结果
+```text
+world_to_local  = inverse(T_omega(chunk_source, front))
+world_to_global = inverse(T_omega(window_last, front))
+T_local(t,c)    = world_to_local  * T_omega(t,c)
+T_global(t,c)   = world_to_global * T_omega(t,c)
+```
 
-三组使用同一 UFO checkpoint、GT intrinsics、198 帧滑窗和三相机 render 协议。P0/P1 保留原 UFO object 链；P2 为避免 Waymo-world object pose 污染而关闭该链，因此 static 指标是最公平的 camera 对比。
+每个 override 只包含窗口内 20 帧，因此 pose-free global reference 明确定义为 override 的最后有效帧，例如首窗为 frame 19；不读取原 UFO 位于右侧独占端点的 GT frame 20。这个选择只定义全局 gauge，局部 reference 仍为每个 5-frame chunk 的首帧。
+
+新版自动 contract check 会检查 manifest/NPZ 不含 GT camera trajectory 或 Sim3 字段、front0 为单位阵、baseline 与尺度统计。它还会在内存中删除 annotation 的 `camera_to_world/ego_pose/ego_to_world` 后实际执行 Dataset；当前 4 个 chunk 全部通过，camera 公式最大误差为 0，local/global matrices 均不同，四个 `scene_from_local` 均非单位阵，object ids 全为 0。
+
+### 14.3 P0/P1/P2/P2.1 结果
+
+四组使用同一 UFO checkpoint、GT intrinsics、198 帧滑窗和三相机 render 协议。P0/P1 保留原 UFO object 链；P2/P2.1 为避免 Waymo-world object pose 污染而关闭该链，因此 static 指标是最公平的 camera 对比。
 
 | 实验 | Camera pose | PSNR | SSIM | Static PSNR | Static SSIM | Depth RMSE |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | P0 | Waymo GT | 24.478 | 0.7805 | 26.700 | 0.8271 | 3.681 m |
 | P1 | Omega + GT Sim3 | 22.594 | 0.7014 | 23.701 | 0.7355 | 4.120 m |
-| P2 | Omega + fixed-rig scale, local front0 gauge | 18.530 | 0.4110 | 18.809 | 0.4307 | 20.313 m |
+| P2 | Omega + fixed-rig scale, identity local/global（错误链） | 18.530 | 0.4110 | 18.809 | 0.4307 | 20.313 m |
+| **P2.1** | **Omega + fixed-rig scale, recurrent local/global** | **22.529** | **0.6865** | **23.661** | **0.7206** | **4.143 m** |
 
-P2 相对 P1 的 full PSNR 下降 4.064 dB，Static PSNR 下降 4.892 dB，depth RMSE 增加约 16.19 m。因此本轮结论是否定的：**当前 VGGT-Omega 三相机输出不能仅靠一个 robust rig-baseline scale 转成接近 GT-Sim3 的 UFO camera trajectory。** 主要证据是跨窗口 scale 高方差和三组 pair baseline 的内部不一致；这不是 GT object dynamic 链造成的，因为 static region 同样显著下降。
+P2.1 相对旧 P2 的 full PSNR 提升 **3.998 dB**，Static PSNR 提升 **4.852 dB**，depth RMSE 从 20.313 m 降至 4.143 m。它与 P1 的 full PSNR 只差 **0.065 dB**、Static PSNR 只差 **0.040 dB**、depth RMSE 只差 0.023 m。
 
-根据预设停止条件，P2 没有接近 P1，因此没有继续做 context-only interpolation/extrapolation。下一步若继续，应先对 Omega 输出施加固定-rig SE(3) projection / bundle adjustment，让同一 timestamp 的三相机严格满足已知相对旋转和平移，再重新估计单一 metric scale；在此之前不能把系统称为 camera pose-free UFO。
+结论因此收紧为：**旧 P2 的约 4 dB 损失主要来自 local/global recurrent 坐标链被错误消除，而不能归因于尺度。** 在完全不使用 GT camera trajectory 或 GT Sim3 的前提下，正确 canonicalization 已使 rig-only P2.1 基本达到 GT-Sim3 P1。这支持继续做 context-only fair NVS；固定-rig SE(3) projection 仍可能改善跨窗口尺度和 camera pair 一致性，但已从“修复 P2 的前置阻塞项”降为后续优化。
 
 本实验使用和未使用的数据边界如下：
 
-| 数据 | P2 是否使用 | 用途 |
+| 数据 | P2.1 是否使用 | 用途 |
 | --- | --- | --- |
 | Waymo `camera_to_world` / `ego_pose` | 否 | 被 contract 禁止并在 runtime 删除验证 |
 | GT Sim3 / Umeyama | 否 | exporter 和 NPZ 均不包含 |
@@ -540,23 +552,27 @@ P2 相对 P1 的 full PSNR 下降 4.064 dB，Static PSNR 下降 4.892 dB，depth
 | GT intrinsics | 是 | 隔离 camera extrinsics 变量；属于固定标定 |
 | target RGB | 是 | Omega all-frame 输入以及离线评估，故不是 fair NVS |
 | GT RGB / depth / dynamic mask | 仅评估 | PSNR、depth RMSE、static/dynamic region 划分 |
-| GT object world pose | 否 | P2 instance 链强制为空 |
+| GT object world pose | 否 | P2.1 instance 链强制为空 |
 
 ```text
 outputs/scene621_group_meeting/rig_pose_free/
 ├── contract_check.json
-├── p0_p1_p2_summary.json
-├── p0_p1_p2_summary.csv
+├── contract_check_p21.json
+├── p0_p1_p2_p21_summary.json
+├── p0_p1_p2_p21_summary.csv
 ├── omega_rig_local/sequence_rig_pose_metrics.json
 ├── P0_GT_camera/metrics.json
 ├── P1_Omega_GT_Sim3/metrics.json
 ├── P2_Omega_rig_only/
 │   ├── metrics.json
 │   └── P2_Omega_rig_only_full_scene_render_3cam.mp4
-└── P0_top_P1_middle_P2_bottom_full_scene_render_3cam.mp4
+├── P21_Omega_rig_only_recurrent/
+│   ├── metrics.json
+│   └── P21_Omega_rig_only_recurrent_full_scene_render_3cam.mp4
+└── P0_P1_P2_P21_vertical_full_scene_render_3cam.mp4
 ```
 
-两段 P2/对照视频均为 198 帧、10 FPS、19.8 秒纯 render。P2 单独视频为 720 x 160；三行对照为 720 x 480，上 P0、中 P1、下 P2，没有 GT 或文字覆盖。
+P2.1 和四行对照视频均为 198 帧、10 FPS、19.8 秒纯 render。P2.1 单独视频为 720 x 160；四行对照为 720 x 640，从上到下依次为 P0、P1、旧 P2、P2.1，没有 GT 或文字覆盖。
 
 ```text
 config: configs/experiments/ufo_scene621_r1_gaussian_coverage_resume10k_2k_4090.json

@@ -61,6 +61,11 @@ class PoseOverrideStore:
             self._load(scene_name)
         return self._coordinate_frame
 
+    def frame_ids(self, scene_name):
+        if self._scene_name != scene_name:
+            self._load(scene_name)
+        return tuple(sorted({frame_id for frame_id, _ in self._poses}))
+
     def get(self, scene_name, frame_id, camera_id):
         if self._scene_name != scene_name:
             self._load(scene_name)

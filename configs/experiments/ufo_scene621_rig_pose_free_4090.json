@@ -100,6 +100,7 @@
   "seed": 1,
   "keep_n_ckpts": 12,
   "pose_free_camera_only": true,
+  "pose_free_coordinate_mode": "identity",
   "pose_override_mode": "all",
   "intrinsics_override_mode": "none"
 }

@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ufo.dataset.dataset import UFODataset
+from ufo.dataset.constants import DATASET_DICT, DATASETS
+from ufo.paper_contract import relative_se3
 
 
 FORBIDDEN_KEYS = {
@@ -126,6 +128,9 @@ def main():
             "observations": len(predicted),
         }
     config = json.loads(args.config.read_text())
+    coordinate_mode = config.get("pose_free_coordinate_mode", "identity")
+    if coordinate_mode not in ("identity", "recurrent"):
+        raise ValueError(f"invalid pose_free_coordinate_mode={coordinate_mode!r}")
     config["pose_override_dir"] = str(args.pose_root / f"start_{windows[0]['start_index']:03d}")
     dataset = UFODataset(
         data_root=config["data_root"],
@@ -150,16 +155,97 @@ def main():
         if dataset.annotations[0].pop(forbidden, None) is not None:
             removed.append(forbidden)
     chunks = dataset.__getitem__(0, windows[0]["start_index"], return_all=True)
+    runtime_check = {
+        "passed": True,
+        "removed_before_dataset_getitem": removed,
+        "chunks_checked": len(chunks),
+        "coordinate_mode": coordinate_mode,
+        "object_instance_ids_zero": True,
+    }
     for chunk in chunks:
         for role in ("context", "target"):
-            payload = chunk[role]
-            if not torch.equal(payload["camtoworld"], payload["camtoworld_global"]):
-                raise ValueError(f"{role} local/global camera frames differ")
-            if int(payload["instances_id"].sum()) != 0:
+            if int(chunk[role]["instances_id"].sum()) != 0:
                 raise ValueError(f"{role} contains GT-world object instances")
 
+    if coordinate_mode == "identity":
+        for chunk in chunks:
+            for role in ("context", "target"):
+                payload = chunk[role]
+                if not torch.equal(payload["camtoworld"], payload["camtoworld_global"]):
+                    raise ValueError(f"legacy {role} local/global camera frames differ")
+        runtime_check["local_global_camera_matrices_identical"] = True
+    else:
+        scene_name = dataset.annotations[0]["scene_name"]
+        dataset_name = dataset.annotations[0]["dataset"]
+        cameras = DATASET_DICT[dataset_name]["camera_list"][config["num_max_cameras"]]
+        ref_camera = DATASET_DICT[dataset_name]["ref_camera"]
+        canonical_to_flu = np.asarray(
+            DATASETS[dataset_name]["canonical_to_flu"], dtype=np.float64
+        )
+        opencv_to_dataset = np.asarray(
+            DATASETS[dataset_name]["opencv2dataset"], dtype=np.float64
+        )
+        global_frame = dataset.pose_override_store.frame_ids(scene_name)[-1]
+        global_ref = dataset.pose_override_store.get(scene_name, global_frame, ref_camera)
+        world_to_global = np.linalg.inv(global_ref)
+        formula_max_error = 0.0
+        local_global_max_differences = []
+        scene_from_local_identity_errors = []
+        for chunk in chunks:
+            source_frame = int(chunk["context"]["frame_idx"][0].item())
+            local_ref = dataset.pose_override_store.get(scene_name, source_frame, ref_camera)
+            world_to_local = np.linalg.inv(local_ref)
+            for role in ("context", "target"):
+                payload = chunk[role]
+                frame_ids = payload["frame_idx"].to(torch.int64).tolist()
+                expected_local = []
+                expected_global = []
+                for frame_id in frame_ids:
+                    for camera in cameras:
+                        pose = dataset.pose_override_store.get(scene_name, frame_id, camera)
+                        expected_local.append(
+                            canonical_to_flu @ world_to_local @ pose @ opencv_to_dataset
+                        )
+                        expected_global.append(
+                            canonical_to_flu @ world_to_global @ pose @ opencv_to_dataset
+                        )
+                expected_local = torch.from_numpy(np.stack(expected_local)).float()
+                expected_global = torch.from_numpy(np.stack(expected_global)).float()
+                formula_max_error = max(
+                    formula_max_error,
+                    float((payload["camtoworld"] - expected_local).abs().max()),
+                    float((payload["camtoworld_global"] - expected_global).abs().max()),
+                )
+                local_global_max_differences.append(float(
+                    (payload["camtoworld"] - payload["camtoworld_global"]).abs().max()
+                ))
+            scene_from_local = relative_se3(
+                chunk["context"]["camtoworld_global"][0].float(),
+                chunk["context"]["camtoworld"][0].float(),
+            )
+            scene_from_local_identity_errors.append(float(
+                (scene_from_local - torch.eye(4)).abs().max()
+            ))
+        if formula_max_error > 1e-5:
+            raise ValueError(f"runtime camera formula mismatch: {formula_max_error}")
+        if not all(value > 1e-6 for value in local_global_max_differences):
+            raise ValueError("P2.1 unexpectedly collapsed a local/global camera pair")
+        if not all(value > 1e-6 for value in scene_from_local_identity_errors):
+            raise ValueError("P2.1 scene_from_local unexpectedly became identity")
+        runtime_check.update({
+            "global_reference_policy": "last_frame_in_pose_override",
+            "global_reference_frame": global_frame,
+            "camera_formula_max_abs_error": formula_max_error,
+            "local_global_max_abs_differences": local_global_max_differences,
+            "scene_from_local_identity_max_abs_errors": scene_from_local_identity_errors,
+            "local_global_camera_matrices_distinct": True,
+        })
+
     report = {
-        "contract": "rig_pose_free_v1",
+        "contract": (
+            "rig_pose_free_recurrent_v2"
+            if coordinate_mode == "recurrent" else "rig_pose_free_v1"
+        ),
         "passed": True,
         "forbidden_camera_pose_sources": sorted(FORBIDDEN_KEYS),
         "allowed_metric_source": "fixed camera_to_ego rig calibration",
@@ -168,13 +254,7 @@ def main():
         "scale_std": float(scales.std()),
         "scale_coefficient_of_variation": float(scales.std() / scales.mean()),
         "aggregate_baselines": aggregate_baselines,
-        "runtime_sanitized_annotation_check": {
-            "passed": True,
-            "removed_before_dataset_getitem": removed,
-            "chunks_checked": len(chunks),
-            "local_global_camera_matrices_identical": True,
-            "object_instance_ids_zero": True,
-        },
+        "runtime_sanitized_annotation_check": runtime_check,
         "windows": windows,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -91,6 +91,11 @@ def get_args_parser():
     parser.add_argument("--pose_free_camera_only", action="store_true",
                         help="Use rig-local camera overrides and disable GT-world object poses")
     parser.add_argument(
+        "--pose_free_coordinate_mode", choices=("identity", "recurrent"),
+        default="identity",
+        help="Use legacy shared coordinates or restore UFO local/global canonicalization",
+    )
+    parser.add_argument(
         "--inference_assignment_mode", choices=("predicted", "oracle_bbox"),
         default="predicted",
         help="Use predicted assignment or a hard GT-box oracle during eval",

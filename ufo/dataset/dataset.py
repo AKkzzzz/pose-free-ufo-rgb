@@ -128,6 +128,9 @@ class UFODataset(Dataset):
         self.skip_sky_mask = skip_sky_mask
         self.pose_override_mode = getattr(args, "pose_override_mode", "none")
         self.pose_free_camera_only = getattr(args, "pose_free_camera_only", False)
+        self.pose_free_coordinate_mode = getattr(
+            args, "pose_free_coordinate_mode", "identity"
+        )
         pose_override_dir = getattr(args, "pose_override_dir", None)
         if self.pose_override_mode not in ("none", "context", "all"):
             raise ValueError(f"invalid pose_override_mode={self.pose_override_mode!r}")
@@ -138,6 +141,14 @@ class UFODataset(Dataset):
         )
         if self.pose_free_camera_only and self.pose_override_mode != "all":
             raise ValueError("pose_free_camera_only requires pose_override_mode='all'")
+        if self.pose_free_coordinate_mode not in ("identity", "recurrent"):
+            raise ValueError(
+                f"invalid pose_free_coordinate_mode={self.pose_free_coordinate_mode!r}"
+            )
+        if self.pose_free_coordinate_mode != "identity" and not self.pose_free_camera_only:
+            raise ValueError(
+                "pose_free_coordinate_mode='recurrent' requires pose_free_camera_only"
+            )
         self.intrinsics_override_mode = getattr(args, "intrinsics_override_mode", "none")
         intrinsics_override_dir = getattr(args, "intrinsics_override_dir", None)
         if self.intrinsics_override_mode not in ("none", "context", "all"):
@@ -313,12 +324,15 @@ class UFODataset(Dataset):
         camera_list = DATASET_DICT[dataset_name]["camera_list"][self.num_max_cams]
         ref_camera_name = DATASET_DICT[dataset_name]["ref_camera"]
 
-        if self.pose_free_camera_only:
-            # Rig-local overrides already share one metric world frame. Re-canonicalizing
-            # here would either change that gauge or fall back to a GT global camera pose.
+        if self.pose_free_camera_only and self.pose_free_coordinate_mode == "identity":
+            # Legacy P2 diagnostic. Kept only so the published P2 result remains
+            # reproducible; recurrent pose-free runs must use the branch below.
             world_to_canonical = np.eye(4, dtype=np.float64)
             world_to_canonical_global = np.eye(4, dtype=np.float64)
         else:
+            # In P2.1 both references come from the same rig-local Omega override.
+            # This preserves UFO's current-chunk/local versus persistent/global
+            # coordinate contract without consulting a GT camera trajectory.
             c2w_real_cur_frame = self._camera_to_world(
                 scene_json, ref_camera_name, source_frame_idx, "context"
             )
@@ -583,6 +597,26 @@ class UFODataset(Dataset):
             first_context_idx = None
             last_frame_idx = initial_start_frame + num_max_future_frames
             global_reference_frame_idx = min(last_frame_idx, num_timesteps - 1)
+            if (
+                self.pose_free_camera_only
+                and self.pose_free_coordinate_mode == "recurrent"
+            ):
+                override_frames = self.pose_override_store.frame_ids(
+                    scene_json["scene_name"]
+                )
+                if not override_frames:
+                    raise ValueError("pose-free override contains no frames")
+                global_reference_frame_idx = override_frames[-1]
+                if not (
+                    initial_start_frame
+                    <= global_reference_frame_idx
+                    < last_frame_idx
+                ):
+                    raise ValueError(
+                        "pose-free global reference must lie inside the current "
+                        f"window [{initial_start_frame}, {last_frame_idx}); got "
+                        f"{global_reference_frame_idx}"
+                    )
 
             # get all possible instances
             frame_instances = scene_json['frame_instances']
