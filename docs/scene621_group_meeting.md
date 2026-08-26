@@ -482,6 +482,82 @@ outputs/scene621_group_meeting/dynamic_assignment_r2/
 
 两段长视频均覆盖 frame 0--197、198 帧、10 FPS、19.8 秒。R2 单独视频为 720 x 160；对照视频为 720 x 320，上 R0、下 R2。两者都只包含 front-left、front、front-right 三相机 render，没有 GT、指标文字或使用说明覆盖。
 
+## 14. Rig-only metric camera：0 GT camera pose diagnostic
+
+这一阶段把定义收紧为：**推理和尺度恢复过程中禁止使用任何 Waymo `camera_to_world`、`ego_pose` 或 GT Sim(3)**。VGGT-Omega 每个窗口仍看全部 20 x 3 RGB，所以这是 all-frame camera diagnostic，不是 fair NVS。UFO checkpoint 仍是前述用 GT camera pose 训练的 scene621 10k 模型；这里验证的是 inference camera replacement，不是 pose-free training。
+
+### 14.1 Rig-only 尺度和局部世界
+
+允许使用的唯一 metric pose 来源是 annotation 中固定的 `camera_to_ego` 硬件标定。三相机真实 baseline 为：左--前 0.1244 m、前--右 0.0854 m、左--右 0.1858 m。对每个窗口所有 timestamp 和 camera pair 计算：
+
+```text
+scale(pair, time) = calibrated_baseline(pair) / Omega_predicted_baseline(pair, time)
+window scale = median(all pair/time ratios)
+```
+
+随后先把全部 Omega c2w 左乘首时刻 front c2w 的逆，再只缩放 translation。NPZ 中首时刻 front camera 的 c2w 因而严格为单位阵；进入 UFO 时只做固定 OpenCV 坐标轴约定转换，不对齐 Waymo global world。
+
+10 个窗口的 scale 均值为 13.2473，标准差 4.9606，变异系数 37.45%。这已经说明 Omega 的 arbitrary scale 在不同 20 帧窗口间很不稳定。更重要的是，一个 scale 不能同时修正三个预测 rig baseline：例如 start=0 的左--右中位 baseline 为 0.1858 m，几乎等于标定值；但左--前为 0.1743 m、前--右仅 0.0351 m，分别偏约 5 cm。Omega 输出并不满足严格刚性三相机 rig。
+
+| Camera pair | 标定 baseline | 200 个窗口内观测的预测中位数 | 绝对误差中位数 |
+| --- | ---: | ---: | ---: |
+| 左--前 | 0.1244 m | 0.2059 m | 0.0815 m |
+| 前--右 | 0.0854 m | 0.0477 m | 0.0404 m |
+| 左--右 | 0.1858 m | 0.18579 m | 0.0060 m |
+
+因此 robust median scale 实际主要锚住了最长、最稳定的左--右 pair，不能把另外两个 camera center 同时投影回真实 rig。表中的 200 个观测来自 10 个 20-frame Omega window；末窗口与前一窗口按现有长序列协议有 2 帧输入重叠，render 汇总仍按 frame id 去重为 198 帧。
+
+### 14.2 UFO local-pose-free 输入路径
+
+原 Dataset 的 `world_to_canonical_global` 会回退读取 GT camera pose，object instance 又位于 Waymo world。新路径作了两项强制隔离：
+
+1. `context_camtoworlds`、`context_camtoworlds_global`、`target_camtoworlds` 和 `target_camtoworlds_global` 全部直接来自同一个 rig-local metric override；缺失或坐标类型不符立即报错，不允许 GT fallback。
+2. pose-free camera-only 模式不加载 instance world pose，所有 instance id 为 0，bbox dynamic transform 等价于 identity。Dynamic PSNR 因此只作参考，正式结论看 full/static RGB 与 depth。
+
+自动 contract check 会检查 manifest/NPZ 不含 GT camera trajectory 或 Sim3 字段、front0 为单位阵、baseline 与尺度统计。它还会在内存中删除 annotation 的 `camera_to_world/ego_pose/ego_to_world` 后实际执行 Dataset；当前 4 个 chunk 全部通过，local/global camera matrices 完全一致，object ids 全为 0。
+
+### 14.3 P0/P1/P2 结果
+
+三组使用同一 UFO checkpoint、GT intrinsics、198 帧滑窗和三相机 render 协议。P0/P1 保留原 UFO object 链；P2 为避免 Waymo-world object pose 污染而关闭该链，因此 static 指标是最公平的 camera 对比。
+
+| 实验 | Camera pose | PSNR | SSIM | Static PSNR | Static SSIM | Depth RMSE |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| P0 | Waymo GT | 24.478 | 0.7805 | 26.700 | 0.8271 | 3.681 m |
+| P1 | Omega + GT Sim3 | 22.594 | 0.7014 | 23.701 | 0.7355 | 4.120 m |
+| P2 | Omega + fixed-rig scale, local front0 gauge | 18.530 | 0.4110 | 18.809 | 0.4307 | 20.313 m |
+
+P2 相对 P1 的 full PSNR 下降 4.064 dB，Static PSNR 下降 4.892 dB，depth RMSE 增加约 16.19 m。因此本轮结论是否定的：**当前 VGGT-Omega 三相机输出不能仅靠一个 robust rig-baseline scale 转成接近 GT-Sim3 的 UFO camera trajectory。** 主要证据是跨窗口 scale 高方差和三组 pair baseline 的内部不一致；这不是 GT object dynamic 链造成的，因为 static region 同样显著下降。
+
+根据预设停止条件，P2 没有接近 P1，因此没有继续做 context-only interpolation/extrapolation。下一步若继续，应先对 Omega 输出施加固定-rig SE(3) projection / bundle adjustment，让同一 timestamp 的三相机严格满足已知相对旋转和平移，再重新估计单一 metric scale；在此之前不能把系统称为 camera pose-free UFO。
+
+本实验使用和未使用的数据边界如下：
+
+| 数据 | P2 是否使用 | 用途 |
+| --- | --- | --- |
+| Waymo `camera_to_world` / `ego_pose` | 否 | 被 contract 禁止并在 runtime 删除验证 |
+| GT Sim3 / Umeyama | 否 | exporter 和 NPZ 均不包含 |
+| 固定 `camera_to_ego` | 是 | 三相机硬件 baseline 尺度 |
+| GT intrinsics | 是 | 隔离 camera extrinsics 变量；属于固定标定 |
+| target RGB | 是 | Omega all-frame 输入以及离线评估，故不是 fair NVS |
+| GT RGB / depth / dynamic mask | 仅评估 | PSNR、depth RMSE、static/dynamic region 划分 |
+| GT object world pose | 否 | P2 instance 链强制为空 |
+
+```text
+outputs/scene621_group_meeting/rig_pose_free/
+├── contract_check.json
+├── p0_p1_p2_summary.json
+├── p0_p1_p2_summary.csv
+├── omega_rig_local/sequence_rig_pose_metrics.json
+├── P0_GT_camera/metrics.json
+├── P1_Omega_GT_Sim3/metrics.json
+├── P2_Omega_rig_only/
+│   ├── metrics.json
+│   └── P2_Omega_rig_only_full_scene_render_3cam.mp4
+└── P0_top_P1_middle_P2_bottom_full_scene_render_3cam.mp4
+```
+
+两段 P2/对照视频均为 198 帧、10 FPS、19.8 秒纯 render。P2 单独视频为 720 x 160；三行对照为 720 x 480，上 P0、中 P1、下 P2，没有 GT 或文字覆盖。
+
 ```text
 config: configs/experiments/ufo_scene621_r1_gaussian_coverage_resume10k_2k_4090.json
 output: outputs/scene621_assignment_r1/gaussian_coverage_resume10k_2k/

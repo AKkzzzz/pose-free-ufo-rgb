@@ -29,6 +29,10 @@ def parse_args():
         "--metadata-only", action="store_true",
         help="Derive the paper frame protocol without decoding RGB/masks",
     )
+    parser.add_argument(
+        "--rig-pose-free", action="store_true",
+        help="Export only fixed rig calibration; omit every per-frame GT camera pose",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -105,9 +109,6 @@ def main():
                         raise ValueError(f"duplicate manifest image {key}")
                     seen.add(key)
                     relative_path = scene_json["relative_image_path"][camera_id][frame_id]
-                    gt_native = np.asarray(
-                        scene_json["camera_to_world"][camera_id][frame_id], dtype=np.float64
-                    )
                     fx, fy, cx, cy = np.asarray(
                         scene_json["normalized_intrinsics"][camera_id], dtype=np.float64
                     )
@@ -117,16 +118,27 @@ def main():
                         [0.0, fy * height, cy * height],
                         [0.0, 0.0, 1.0],
                     ])
-                    entries.append({
+                    entry = {
                         "frame_id": frame_id,
                         "camera_id": camera_id,
                         "role": role,
                         "chunk_index": chunk_index,
                         "path": str(image_path(cli.data_root, dataset_name, relative_path).resolve()),
-                        "gt_camera_to_world": gt_native.tolist(),
-                        "gt_c2w_opencv": (gt_native @ opencv_to_dataset).tolist(),
-                        "gt_intrinsics_ufo": gt_intrinsics.tolist(),
-                    })
+                    }
+                    entry[
+                        "calibrated_intrinsics_ufo" if cli.rig_pose_free
+                        else "gt_intrinsics_ufo"
+                    ] = gt_intrinsics.tolist()
+                    if not cli.rig_pose_free:
+                        gt_native = np.asarray(
+                            scene_json["camera_to_world"][camera_id][frame_id],
+                            dtype=np.float64,
+                        )
+                        entry.update({
+                            "gt_camera_to_world": gt_native.tolist(),
+                            "gt_c2w_opencv": (gt_native @ opencv_to_dataset).tolist(),
+                        })
+                    entries.append(entry)
 
     manifest = {
         "schema_version": 1,
@@ -142,6 +154,17 @@ def main():
         "annotation_file": str(cli.annotation_file.resolve()),
         "images": entries,
     }
+    if cli.rig_pose_free:
+        manifest["pose_contract"] = {
+            "name": "rig_pose_free_v1",
+            "forbidden_sources": ["camera_to_world", "ego_pose", "ego_to_world", "gt_sim3"],
+            "metric_source": "camera_to_ego_fixed_rig_calibration",
+            "world_gauge": "first_timestamp_front_camera",
+        }
+        manifest["rig_camera_to_ego"] = {
+            camera_id: scene_json["camera_to_ego"][camera_id]
+            for camera_id in cameras
+        }
     cli.output.parent.mkdir(parents=True, exist_ok=True)
     cli.output.write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({

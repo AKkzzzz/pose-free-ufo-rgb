@@ -88,6 +88,8 @@ def get_args_parser():
                         help="Root containing Omega intrinsics in the pose override NPZ")
     parser.add_argument("--intrinsics_override_mode", choices=("none", "context", "all"),
                         default="none")
+    parser.add_argument("--pose_free_camera_only", action="store_true",
+                        help="Use rig-local camera overrides and disable GT-world object poses")
     parser.add_argument(
         "--inference_assignment_mode", choices=("predicted", "oracle_bbox"),
         default="predicted",
@@ -365,6 +367,7 @@ def compute_metrics(pred_dict, target_dict, input_dict, device):
         "psnr": [], "ssim": [],
         "occupied_psnr": [], "occupied_ssim": [],
         "dynamic_psnr": [], "dynamic_ssim": [],
+        "static_psnr": [], "static_ssim": [],
         "depth_rmse": [], "dynamic_depth_rmse": [],
     }
 
@@ -406,6 +409,15 @@ def compute_metrics(pred_dict, target_dict, input_dict, device):
 
         # Dynamic PSNR/SSIM
         dm = dyn_flat[idx]
+        sm = ~dm
+        if sm.any():
+            pr_static = rearrange(pr_flat[idx], "h w c -> c h w")[:, sm]
+            gt_static = rearrange(gt_flat[idx], "h w c -> c h w")[:, sm]
+            mse_static = F.mse_loss(pr_static, gt_static).item()
+            metrics["static_psnr"].append(-10.0 * np.log10(max(mse_static, 1e-12)))
+            if ssim_map is None:
+                ssim_map = ssim(pr_np, gt_np, data_range=1.0, channel_axis=-1, full=True)[1]
+            metrics["static_ssim"].append(float(ssim_map[sm.cpu().numpy()].mean()))
         if dm.any():
             pr_dyn = rearrange(pr_flat[idx], "h w c -> c h w")[:, dm]
             gt_dyn = rearrange(gt_flat[idx], "h w c -> c h w")[:, dm]

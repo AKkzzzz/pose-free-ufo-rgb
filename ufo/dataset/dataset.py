@@ -127,6 +127,7 @@ class UFODataset(Dataset):
         self.load_ground_label = load_ground_label
         self.skip_sky_mask = skip_sky_mask
         self.pose_override_mode = getattr(args, "pose_override_mode", "none")
+        self.pose_free_camera_only = getattr(args, "pose_free_camera_only", False)
         pose_override_dir = getattr(args, "pose_override_dir", None)
         if self.pose_override_mode not in ("none", "context", "all"):
             raise ValueError(f"invalid pose_override_mode={self.pose_override_mode!r}")
@@ -135,6 +136,8 @@ class UFODataset(Dataset):
         self.pose_override_store = (
             PoseOverrideStore(pose_override_dir) if self.pose_override_mode != "none" else None
         )
+        if self.pose_free_camera_only and self.pose_override_mode != "all":
+            raise ValueError("pose_free_camera_only requires pose_override_mode='all'")
         self.intrinsics_override_mode = getattr(args, "intrinsics_override_mode", "none")
         intrinsics_override_dir = getattr(args, "intrinsics_override_dir", None)
         if self.intrinsics_override_mode not in ("none", "context", "all"):
@@ -183,6 +186,15 @@ class UFODataset(Dataset):
         )
 
     def _camera_to_world(self, scene_json, camera, frame_idx, role):
+        if self.pose_free_camera_only:
+            pose = self.pose_override_store.get(scene_json["scene_name"], frame_idx, camera)
+            frame = self.pose_override_store.coordinate_frame(scene_json["scene_name"])
+            if frame != "rig_local_metric":
+                raise ValueError(
+                    "pose_free_camera_only requires a rig_local_metric override, "
+                    f"got {frame!r}"
+                )
+            return pose
         use_override = self.pose_override_store is not None and (
             role == "context" or (role == "target" and self.pose_override_mode == "all")
         )
@@ -211,6 +223,13 @@ class UFODataset(Dataset):
         return len(self.annotations)
 
     def _with_instances(self, scene_json):
+        if self.pose_free_camera_only:
+            scene_json = scene_json.copy()
+            scene_json["instances_info"] = {}
+            scene_json["frame_instances"] = {
+                str(frame): [] for frame in range(scene_json["num_timesteps"])
+            }
+            return scene_json
         if "instances_info" in scene_json and "frame_instances" in scene_json:
             return scene_json
         cache_key = scene_json["scene_name"]
@@ -294,15 +313,20 @@ class UFODataset(Dataset):
         camera_list = DATASET_DICT[dataset_name]["camera_list"][self.num_max_cams]
         ref_camera_name = DATASET_DICT[dataset_name]["ref_camera"]
 
-        c2w_real_cur_frame = self._camera_to_world(
-            scene_json, ref_camera_name, source_frame_idx, "context"
-        )
-        c2w_real_global = self._camera_to_world(
-            scene_json, ref_camera_name, global_source_frame_idx, "global"
-        )
-
-        world_to_canonical = np.linalg.inv(c2w_real_cur_frame)
-        world_to_canonical_global = np.linalg.inv(c2w_real_global)
+        if self.pose_free_camera_only:
+            # Rig-local overrides already share one metric world frame. Re-canonicalizing
+            # here would either change that gauge or fall back to a GT global camera pose.
+            world_to_canonical = np.eye(4, dtype=np.float64)
+            world_to_canonical_global = np.eye(4, dtype=np.float64)
+        else:
+            c2w_real_cur_frame = self._camera_to_world(
+                scene_json, ref_camera_name, source_frame_idx, "context"
+            )
+            c2w_real_global = self._camera_to_world(
+                scene_json, ref_camera_name, global_source_frame_idx, "global"
+            )
+            world_to_canonical = np.linalg.inv(c2w_real_cur_frame)
+            world_to_canonical_global = np.linalg.inv(c2w_real_global)
 
         for camera in camera_list:
             frame_camera_to_world = self._camera_to_world(

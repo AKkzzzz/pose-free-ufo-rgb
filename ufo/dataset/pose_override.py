@@ -11,6 +11,7 @@ class PoseOverrideStore:
         self._scene_name = None
         self._poses = None
         self._intrinsics = None
+        self._coordinate_frame = None
 
     def _load(self, scene_name):
         path = self.root / scene_name / "omega_pose_override.npz"
@@ -24,7 +25,15 @@ class PoseOverrideStore:
                 )
             frame_ids = payload["frame_ids"].astype(np.int64)
             camera_ids = payload["camera_ids"].astype(str)
-            poses = payload["omega_camera_to_world_aligned"].astype(np.float64)
+            coordinate_frame = (
+                str(payload["coordinate_frame"].item())
+                if "coordinate_frame" in payload else "gt_sim3_aligned"
+            )
+            pose_key = (
+                "omega_camera_to_world_rig_local"
+                if coordinate_frame == "rig_local_metric" else "omega_camera_to_world_aligned"
+            )
+            poses = payload[pose_key].astype(np.float64)
             intrinsics = (
                 payload["predicted_intrinsics_ufo"].astype(np.float64)
                 if "predicted_intrinsics_ufo" in payload else None
@@ -40,11 +49,17 @@ class PoseOverrideStore:
                 raise ValueError(f"duplicate pose override entry {key} in {path}")
             mapping[key] = pose
         self._scene_name = scene_name
+        self._coordinate_frame = coordinate_frame
         self._poses = mapping
         self._intrinsics = None if intrinsics is None else {
             (int(frame_id), str(camera_id)): intrinsic
             for frame_id, camera_id, intrinsic in zip(frame_ids, camera_ids, intrinsics)
         }
+
+    def coordinate_frame(self, scene_name):
+        if self._scene_name != scene_name:
+            self._load(scene_name)
+        return self._coordinate_frame
 
     def get(self, scene_name, frame_id, camera_id):
         if self._scene_name != scene_name:
