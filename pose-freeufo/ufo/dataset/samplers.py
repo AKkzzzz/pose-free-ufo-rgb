@@ -1,0 +1,174 @@
+# Copyright (C) 2026 Xiaomi Corporation.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied. See the License for the specific language governing
+# permissions and limitations under the License.
+
+import itertools
+import json
+from typing import Any, Optional
+
+import torch
+from torch.utils.data.sampler import Sampler
+
+import ufo.utils.distributed as distributed
+
+
+def _get_torch_dtype(size: int) -> Any:
+    """Return the appropriate PyTorch dtype based on size."""
+    return torch.int32 if size <= 2**31 else torch.int64
+
+
+def _generate_randperm_indices(*, size: int, generator: torch.Generator):
+    """
+    Generate the indices of a random permutation.
+
+    This matches PyTorch's CPU implementation.
+    See: https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/native/TensorFactories.cpp#L900-L921
+    """
+    dtype = _get_torch_dtype(size)
+    perm = torch.arange(size, dtype=dtype)
+    for i in range(size):
+        j = torch.randint(i, size, size=(1,), generator=generator).item()
+        # Always swap even if no-op
+        value = perm[j].item()
+        perm[j] = perm[i].item()
+        perm[i] = value
+        yield value
+
+
+class InfiniteSampler(Sampler):
+    def __init__(
+        self,
+        sample_count: int,
+        shuffle: bool = False,
+        seed: int = 0,
+        start: Optional[int] = None,
+        step: Optional[int] = None,
+        advance: int = 0,
+    ):
+        """
+        A sampler that infinitely yields indices for a dataset.
+
+        Args:
+            sample_count (int): Number of samples in the dataset.
+            shuffle (bool): Whether to shuffle indices.
+            seed (int): Seed for random generator.
+            start (Optional[int]): Starting index for sampling.
+            step (Optional[int]): Step size for sampling.
+            advance (int): Number of indices to skip at the start.
+        """
+        self._sample_count = sample_count
+        self._seed = seed
+        self._shuffle = shuffle
+        self._start = distributed.get_global_rank() if start is None else start
+        self._step = distributed.get_world_size() if step is None else step
+        self._advance = advance
+
+    def set_advance(self, advance: int):
+        self._advance = int(advance)
+
+    def __iter__(self):
+        """Yield indices based on the specified configuration."""
+        iterator = self._shuffled_iterator() if self._shuffle else self._iterator()
+        yield from itertools.islice(iterator, self._advance, None)
+
+    def _iterator(self):
+        """Generate indices sequentially."""
+        assert not self._shuffle
+        while True:
+            iterable = range(self._sample_count)
+            yield from itertools.islice(iterable, self._start, None, self._step)
+
+    def _shuffled_iterator(self):
+        """Generate deterministically shuffled, rank-sharded indices."""
+        assert self._shuffle
+        generator = torch.Generator().manual_seed(self._seed)
+        while True:
+            iterable = _generate_randperm_indices(size=self._sample_count, generator=generator)
+            yield from itertools.islice(iterable, self._start, None, self._step)
+
+
+class DynamicMixtureSampler(Sampler):
+    """Mix audited dynamic-rich windows with the full training scene population."""
+
+    def __init__(self, sample_count, rich_pool_path, rich_ratio, seed, advance=0):
+        self.sample_count = int(sample_count)
+        self.rich_ratio = float(rich_ratio)
+        self.seed = int(seed)
+        self.advance = int(advance)
+        with open(rich_pool_path) as handle:
+            payload = json.load(handle)
+        self.rich_pool = [
+            (int(row["scene_index"]), int(row["start_frame"]))
+            for row in payload["samples"]
+        ]
+        if not self.rich_pool:
+            raise ValueError("dynamic-rich pool is empty")
+
+    def __iter__(self):
+        # Independent rank streams avoid replaying the same rich window on every GPU.
+        rank = distributed.get_global_rank()
+        generator = torch.Generator().manual_seed(self.seed + rank)
+        def stream():
+            while True:
+                if torch.rand((), generator=generator).item() < self.rich_ratio:
+                    i = torch.randint(len(self.rich_pool), (), generator=generator).item()
+                    scene_index, start_frame = self.rich_pool[i]
+                    yield (scene_index, start_frame, True)
+                else:
+                    scene_index = torch.randint(self.sample_count, (), generator=generator).item()
+                    yield (scene_index, -1, False)
+        yield from itertools.islice(stream(), self.advance, None)
+
+    def set_advance(self, advance: int):
+        self.advance = int(advance)
+
+
+class NoPaddingDistributedSampler(Sampler):
+    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=False):
+        """
+        A distributed sampler without padding.
+        Used for distributed evaluation, i.e., when the dataset is not divisible by the number of
+        replicas but we still want to evaluate on the full dataset.
+
+        Args:
+            dataset: The dataset to sample from.
+            num_replicas (int): Number of replicas in distributed setting.
+            rank (int): Rank of the current process.
+            shuffle (bool): Whether to shuffle indices.
+        """
+        self.dataset = dataset
+        self.num_replicas = distributed.get_world_size() if num_replicas is None else num_replicas
+        self.rank = distributed.get_global_rank() if rank is None else rank
+        self.shuffle = shuffle
+        self.num_samples = len(self.dataset) // self.num_replicas
+        self.total_size = self.num_samples * self.num_replicas
+        self.rank_start = self.rank * self.num_samples
+        self.rank_end = (
+            (self.rank + 1) * self.num_samples
+            if self.rank < self.num_replicas - 1
+            else len(self.dataset)
+        )
+
+    def __iter__(self):
+        """Yield indices for the current rank."""
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(0)
+            indices = torch.randperm(len(indices), generator=g).tolist()
+        indices = indices[self.rank_start : self.rank_end]
+        return iter(indices)
+
+    def __len__(self):
+        """Return the number of samples for the current rank."""
+        return self.num_samples

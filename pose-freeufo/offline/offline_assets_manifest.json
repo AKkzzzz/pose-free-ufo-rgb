@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "path": "offline_assets/weights/lpips_vgg.pth",
+      "sha256": "a78928a0af1e5f0fcb1f3b9e8f8c3a2a5a3de244d830ad5c1feddc79b8432868",
+      "purpose": "LPIPS VGG linear weights"
+    },
+    {
+      "path": "offline_assets/weights/vgg16-397923af.pth",
+      "sha256": "397923af8e79cdbb6a7127f12361acd7a2f83e06b05044ddf496e83de57a5bf0",
+      "purpose": "torchvision ImageNet VGG16 weights"
+    },
+    {
+      "path": "offline_assets/gsplat-1.5.3-source.tar.gz",
+      "sha256": "7910528ff6a7e56ae821c5305f207f445af40a12d3eb1bf3f4450f56ff74a8d5",
+      "purpose": "offline CUDA extension source"
+    },
+    {
+      "path": "offline_assets/torch_extensions_portable_v1/gsplat_cuda/gsplat_cuda.so",
+      "sha256": "bef9ff81e90dafe0de7188f10a7c5458d966c4a9e988db1de8917f1fdb098937",
+      "architectures": ["sm_89", "sm_90"],
+      "purpose": "portable gsplat CUDA extension"
+    },
+    {
+      "path": "offline_assets/data_contract/waymo_train.txt",
+      "sha256": "cdaf7273ced4160c85f276fc92a67bdc4b6feef9ed326541049ecfd9401d0713",
+      "expected_entries": 798
+    },
+    {
+      "path": "offline_assets/data_contract/waymo_val.txt",
+      "sha256": "4059b2d732fd36f223f3b67b0cf67e2f469bf77d9bc0b833034fc713fcbdc599",
+      "expected_entries": 202
+    },
+    {
+      "path": "offline_assets/data_contract/waymo_instance_scene_manifest.json",
+      "sha256": "990160d8de8ed35c1abc7792217fce55e7f494452041e107f460fcca0f70ea62",
+      "purpose": "corrected scene-name instance mapping"
+    },
+    {
+      "path": "offline_assets/data_contract/dynamic_rich_pool.json",
+      "sha256": "e3d1fb21a0db89bf7da76b7e1541f51d8995f38fea35609ce2d8fb3f33b6bf0e",
+      "classification": "REPRODUCTION_DECISION"
+    }
+  ]
+}

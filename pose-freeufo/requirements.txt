@@ -1,0 +1,17 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.0
+torchvision
+timm
+einops
+# jaxtyping
+opencv-python
+# matplotlib==3.7.3
+imageio
+imageio-ffmpeg
+gdown
+open3d
+gsplat==1.5.3
+wandb
+tensorboard
+scikit-image
+ipdb

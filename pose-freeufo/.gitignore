@@ -1,0 +1,56 @@
+# Datasets and generated metadata mounts
+/data
+/data/
+
+# Training and evaluation outputs
+/output/
+/outputs/
+/ckpts/
+/checkpoints/
+/tensorboard/
+/wandb/
+/2026*/
+
+# Model artifacts and large offline payloads
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.safetensors
+*.tar
+*.tar.gz
+*.zip
+/offline_assets/
+/h200_transfer/
+
+# Native/JIT build products
+*.so
+*.o
+*.a
+.ninja_deps
+.ninja_log
+build.ninja
+/build/
+/dist/
+
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local credentials and environment overrides
+.env
+.env.*
+*.pem
+*.key
+*credentials*
+*secret*
+
+# Generated geometry and local editor files
+*.pcd
+*.ply
+.DS_Store
+.idea/
+.vscode/

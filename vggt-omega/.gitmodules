@@ -1,0 +1,12 @@
+[submodule "third_party/vggt_official"]
+	path = third_party/vggt_official
+	url = https://github.com/facebookresearch/vggt.git
+[submodule "third_party/dycheck_official"]
+	path = third_party/dycheck_official
+	url = https://github.com/KAIR-BAIR/dycheck.git
+[submodule "third_party/spatialbench"]
+	path = third_party/spatialbench
+	url = https://github.com/Ropedia/SpatialBench.git
+[submodule "third_party/monst3r_eval"]
+	path = third_party/monst3r_eval
+	url = https://github.com/Junyi42/monst3r.git
