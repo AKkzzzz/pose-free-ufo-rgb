@@ -693,17 +693,20 @@ def main(args):
                 "paper_bbox_rotation must be disabled in pose-free-training v1"
             )
 
-        if args.training_sampling_mode != "dynamic_mixture":
+        if args.training_sampling_mode != "uniform":
             blockers.append(
-                "training_sampling_mode must be dynamic_mixture "
-                "so only precomputed pose-free windows are sampled"
+                "formal pose-free training requires uniform window sampling"
             )
 
-        if abs(args.dynamic_sampling_ratio - 1.0) > 1e-8:
-            blockers.append("dynamic_sampling_ratio must be 1.0")
+        if args.dynamic_rich_pool is not None:
+            blockers.append(
+                "dynamic_rich_pool must be null for formal uniform training"
+            )
 
-        if not args.dynamic_rich_pool:
-            blockers.append("dynamic_rich_pool is required")
+        if abs(args.dynamic_sampling_ratio) > 1e-8:
+            blockers.append(
+                "dynamic_sampling_ratio must be 0 for formal uniform training"
+            )
 
         if not args.disable_validation:
             blockers.append(

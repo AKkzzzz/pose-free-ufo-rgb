@@ -58,6 +58,9 @@ with torch.inference_mode(), torch.autocast(
         pred["images"].shape[-2:]
     )
 
+    omega_depth = pred["depth"][0].float().cpu().numpy()
+    omega_depth_conf = pred["depth_conf"][0].float().cpu().numpy()
+
 w2c = homo(extri[0].float().cpu().numpy())
 c2w = np.linalg.inv(w2c)
 
@@ -97,6 +100,10 @@ np.savez_compressed(
     omega_c2w_raw=c2w.astype(np.float32),
 
     predicted_intrinsics_ufo=K_ufo.astype(np.float32),
+
+    # Cached for exact GCA scale estimation without a second Omega pass.
+    omega_depth_raw=omega_depth.astype(np.float32),
+    omega_depth_conf_raw=omega_depth_conf.astype(np.float32),
 )
 
 print("RGB-only Omega exported:", args.output)
