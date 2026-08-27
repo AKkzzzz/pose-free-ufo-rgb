@@ -132,36 +132,82 @@ class UFODataset(Dataset):
             args, "pose_free_coordinate_mode", "identity"
         )
         pose_override_dir = getattr(args, "pose_override_dir", None)
+        self.pose_override_sequence_dir = getattr(
+            args, "pose_override_sequence_dir", None
+        )
+
         if self.pose_override_mode not in ("none", "context", "all"):
             raise ValueError(f"invalid pose_override_mode={self.pose_override_mode!r}")
-        if self.pose_override_mode != "none" and not pose_override_dir:
-            raise ValueError("pose_override_dir is required when pose_override_mode is enabled")
+
+        if (
+            self.pose_override_mode != "none"
+            and not pose_override_dir
+            and not self.pose_override_sequence_dir
+        ):
+            raise ValueError(
+                "pose_override_dir or pose_override_sequence_dir is required "
+                "when pose override is enabled"
+            )
+
         self.pose_override_store = (
-            PoseOverrideStore(pose_override_dir) if self.pose_override_mode != "none" else None
+            PoseOverrideStore(pose_override_dir)
+            if self.pose_override_mode != "none"
+            and pose_override_dir
+            and not self.pose_override_sequence_dir
+            else None
         )
+
         if self.pose_free_camera_only and self.pose_override_mode != "all":
-            raise ValueError("pose_free_camera_only requires pose_override_mode='all'")
+            raise ValueError(
+                "pose_free_camera_only requires pose_override_mode='all'"
+            )
+
         if self.pose_free_coordinate_mode not in ("identity", "recurrent"):
             raise ValueError(
                 f"invalid pose_free_coordinate_mode={self.pose_free_coordinate_mode!r}"
             )
-        if self.pose_free_coordinate_mode != "identity" and not self.pose_free_camera_only:
+
+        if (
+            self.pose_free_coordinate_mode != "identity"
+            and not self.pose_free_camera_only
+        ):
             raise ValueError(
-                "pose_free_coordinate_mode='recurrent' requires pose_free_camera_only"
+                "pose_free_coordinate_mode='recurrent' "
+                "requires pose_free_camera_only"
             )
-        self.intrinsics_override_mode = getattr(args, "intrinsics_override_mode", "none")
-        intrinsics_override_dir = getattr(args, "intrinsics_override_dir", None)
+
+        self.intrinsics_override_mode = getattr(
+            args, "intrinsics_override_mode", "none"
+        )
+        intrinsics_override_dir = getattr(
+            args, "intrinsics_override_dir", None
+        )
+        self.intrinsics_override_sequence_dir = getattr(
+            args, "intrinsics_override_sequence_dir", None
+        )
+
         if self.intrinsics_override_mode not in ("none", "context", "all"):
             raise ValueError(
-                f"invalid intrinsics_override_mode={self.intrinsics_override_mode!r}"
+                f"invalid intrinsics_override_mode="
+                f"{self.intrinsics_override_mode!r}"
             )
-        if self.intrinsics_override_mode != "none" and not intrinsics_override_dir:
+
+        if (
+            self.intrinsics_override_mode != "none"
+            and not intrinsics_override_dir
+            and not self.intrinsics_override_sequence_dir
+        ):
             raise ValueError(
-                "intrinsics_override_dir is required when intrinsics override is enabled"
+                "intrinsics_override_dir or "
+                "intrinsics_override_sequence_dir is required"
             )
+
         self.intrinsics_override_store = (
             PoseOverrideStore(intrinsics_override_dir)
-            if self.intrinsics_override_mode != "none" else None
+            if self.intrinsics_override_mode != "none"
+            and intrinsics_override_dir
+            and not self.intrinsics_override_sequence_dir
+            else None
         )
         if isinstance(annotation_txt_file_list, str):
             annotation_txt_file_list = [annotation_txt_file_list]
@@ -590,8 +636,34 @@ class UFODataset(Dataset):
                 
             # Validate and adjust if necessary
             if initial_start_frame + num_max_future_frames > num_timesteps:
-                initial_start_frame = np.random.randint(0, max(1, num_timesteps - num_max_future_frames))
-            
+                initial_start_frame = np.random.randint(
+                    0, max(1, num_timesteps - num_max_future_frames)
+                )
+
+            # Pose-free training uses precomputed RGB-only Omega+GCA
+            # camera predictions for the exact sampled 20-frame window.
+            if (
+                self.pose_override_mode != "none"
+                and self.pose_override_sequence_dir
+            ):
+                pose_root = (
+                    Path(self.pose_override_sequence_dir)
+                    / f"start_{initial_start_frame:03d}"
+                )
+                self.pose_override_store = PoseOverrideStore(pose_root)
+
+            if (
+                self.intrinsics_override_mode != "none"
+                and self.intrinsics_override_sequence_dir
+            ):
+                intrinsics_root = (
+                    Path(self.intrinsics_override_sequence_dir)
+                    / f"start_{initial_start_frame:03d}"
+                )
+                self.intrinsics_override_store = PoseOverrideStore(
+                    intrinsics_root
+                )
+
             value_list = []
             
             first_context_idx = None

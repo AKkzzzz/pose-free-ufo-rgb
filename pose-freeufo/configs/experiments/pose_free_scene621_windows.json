@@ -1,0 +1,44 @@
+{
+  "samples": [
+    {
+      "scene_index": 0,
+      "start_frame": 0
+    },
+    {
+      "scene_index": 0,
+      "start_frame": 20
+    },
+    {
+      "scene_index": 0,
+      "start_frame": 40
+    },
+    {
+      "scene_index": 0,
+      "start_frame": 60
+    },
+    {
+      "scene_index": 0,
+      "start_frame": 80
+    },
+    {
+      "scene_index": 0,
+      "start_frame": 100
+    },
+    {
+      "scene_index": 0,
+      "start_frame": 120
+    },
+    {
+      "scene_index": 0,
+      "start_frame": 140
+    },
+    {
+      "scene_index": 0,
+      "start_frame": 160
+    },
+    {
+      "scene_index": 0,
+      "start_frame": 178
+    }
+  ]
+}
