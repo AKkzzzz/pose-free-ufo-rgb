@@ -47,20 +47,27 @@ def build_args():
     args = ufo_inference.add_missing_config_values(args, args.config)
     args.full_window_targets = True
     if args.pose_override_mode != "none":
-        if not args.pose_override_sequence_dir:
-            parser.error("--pose_override_sequence_dir is required for pose overrides")
-        args.pose_override_dir = str(
-            Path(args.pose_override_sequence_dir) / f"start_{args.start_indices[0]:03d}"
-        )
-    if args.intrinsics_override_mode != "none":
-        if not args.intrinsics_override_sequence_dir:
-            parser.error(
-                "--intrinsics_override_sequence_dir is required for intrinsics overrides"
+        if args.pose_override_sequence_dir:
+            args.pose_override_dir = str(
+                Path(args.pose_override_sequence_dir)
+                / f"start_{args.start_indices[0]:03d}"
             )
-        args.intrinsics_override_dir = str(
-            Path(args.intrinsics_override_sequence_dir)
-            / f"start_{args.start_indices[0]:03d}"
-        )
+        elif not args.pose_override_dir:
+            parser.error(
+                "pose_override_dir or pose_override_sequence_dir is required"
+            )
+
+    if args.intrinsics_override_mode != "none":
+        if args.intrinsics_override_sequence_dir:
+            args.intrinsics_override_dir = str(
+                Path(args.intrinsics_override_sequence_dir)
+                / f"start_{args.start_indices[0]:03d}"
+            )
+        elif not args.intrinsics_override_dir:
+            parser.error(
+                "intrinsics_override_dir or "
+                "intrinsics_override_sequence_dir is required"
+            )
     return args
 
 
@@ -127,10 +134,20 @@ def main():
     total_metric_images = 0
     try:
         for start_index in args.start_indices:
-            if args.pose_override_mode != "none":
-                root = Path(args.pose_override_sequence_dir) / f"start_{start_index:03d}"
+            if (
+                args.pose_override_mode != "none"
+                and args.pose_override_sequence_dir
+            ):
+                root = (
+                    Path(args.pose_override_sequence_dir)
+                    / f"start_{start_index:03d}"
+                )
                 dataset.pose_override_store = PoseOverrideStore(root)
-            if args.intrinsics_override_mode != "none":
+
+            if (
+                args.intrinsics_override_mode != "none"
+                and args.intrinsics_override_sequence_dir
+            ):
                 root = (
                     Path(args.intrinsics_override_sequence_dir)
                     / f"start_{start_index:03d}"

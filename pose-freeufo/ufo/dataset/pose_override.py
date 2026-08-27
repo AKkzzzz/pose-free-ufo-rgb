@@ -29,10 +29,12 @@ class PoseOverrideStore:
                 str(payload["coordinate_frame"].item())
                 if "coordinate_frame" in payload else "gt_sim3_aligned"
             )
-            pose_key = (
-                "omega_camera_to_world_rig_local"
-                if coordinate_frame == "rig_local_metric" else "omega_camera_to_world_aligned"
-            )
+            if coordinate_frame == "rig_local_metric":
+                pose_key = "omega_camera_to_world_rig_local"
+            elif coordinate_frame == "global_metric":
+                pose_key = "omega_camera_to_world_global_metric"
+            else:
+                pose_key = "omega_camera_to_world_aligned"
             poses = payload[pose_key].astype(np.float64)
             intrinsics = (
                 payload["predicted_intrinsics_ufo"].astype(np.float64)

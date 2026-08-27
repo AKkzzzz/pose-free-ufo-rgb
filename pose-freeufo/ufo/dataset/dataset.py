@@ -246,9 +246,9 @@ class UFODataset(Dataset):
         if self.pose_free_camera_only:
             pose = self.pose_override_store.get(scene_json["scene_name"], frame_idx, camera)
             frame = self.pose_override_store.coordinate_frame(scene_json["scene_name"])
-            if frame != "rig_local_metric":
+            if frame not in ("rig_local_metric", "global_metric"):
                 raise ValueError(
-                    "pose_free_camera_only requires a rig_local_metric override, "
+                    "pose_free_camera_only requires metric camera overrides, "
                     f"got {frame!r}"
                 )
             return pose
@@ -630,14 +630,17 @@ class UFODataset(Dataset):
             
             # Store the initial starting frame (rename to avoid confusion)
             if context_frame_idx < 0:
-                initial_start_frame = np.random.randint(0, max(1, num_timesteps - num_max_future_frames))
+                initial_start_frame = np.random.randint(
+                    0,
+                    max(1, num_timesteps - num_max_future_frames + 1),
+                )
             else:
                 initial_start_frame = context_frame_idx
                 
             # Validate and adjust if necessary
             if initial_start_frame + num_max_future_frames > num_timesteps:
                 initial_start_frame = np.random.randint(
-                    0, max(1, num_timesteps - num_max_future_frames)
+                    0, max(1, num_timesteps - num_max_future_frames + 1)
                 )
 
             # Pose-free training uses precomputed RGB-only Omega+GCA
@@ -678,17 +681,32 @@ class UFODataset(Dataset):
                 )
                 if not override_frames:
                     raise ValueError("pose-free override contains no frames")
-                global_reference_frame_idx = override_frames[-1]
-                if not (
-                    initial_start_frame
-                    <= global_reference_frame_idx
-                    < last_frame_idx
-                ):
-                    raise ValueError(
-                        "pose-free global reference must lie inside the current "
-                        f"window [{initial_start_frame}, {last_frame_idx}); got "
-                        f"{global_reference_frame_idx}"
+
+                override_frame = self.pose_override_store.coordinate_frame(
+                    scene_json["scene_name"]
+                )
+
+                if override_frame == "global_metric":
+                    # One global trajectory covers the complete scene.
+                    # Canonicalize only with respect to the current training
+                    # sample; do not use the final frame of the whole scene.
+                    global_reference_frame_idx = min(
+                        last_frame_idx - 1,
+                        num_timesteps - 1,
                     )
+                else:
+                    # Legacy per-window Omega gauge.
+                    global_reference_frame_idx = override_frames[-1]
+                    if not (
+                        initial_start_frame
+                        <= global_reference_frame_idx
+                        < last_frame_idx
+                    ):
+                        raise ValueError(
+                            "pose-free global reference must lie inside the current "
+                            f"window [{initial_start_frame}, {last_frame_idx}); got "
+                            f"{global_reference_frame_idx}"
+                        )
 
             # get all possible instances
             frame_instances = scene_json['frame_instances']

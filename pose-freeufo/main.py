@@ -658,10 +658,18 @@ def main(args):
         if args.intrinsics_override_mode != "all":
             blockers.append("intrinsics_override_mode must be all")
 
-        if not args.pose_override_sequence_dir:
-            blockers.append("pose_override_sequence_dir is required")
-        if not args.intrinsics_override_sequence_dir:
-            blockers.append("intrinsics_override_sequence_dir is required")
+        if not args.pose_override_dir and not args.pose_override_sequence_dir:
+            blockers.append(
+                "pose_override_dir or pose_override_sequence_dir is required"
+            )
+        if (
+            not args.intrinsics_override_dir
+            and not args.intrinsics_override_sequence_dir
+        ):
+            blockers.append(
+                "intrinsics_override_dir or "
+                "intrinsics_override_sequence_dir is required"
+            )
 
         forbidden_flags = {
             "load_depth": args.load_depth,
