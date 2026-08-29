@@ -5,13 +5,13 @@ ROOT=/inspire/hdd/project/intelligent-driving-agent/guoluosong-253108120129/work
 UFO=$ROOT/pose-freeufo
 DGGTPY=/root/miniconda3/envs/dggt_data/bin/python
 
-CONFIG=$UFO/configs/experiments/ufo_scene621_pose_free_gca_uniform_10k_4090.json
+CONFIG=$UFO/configs/pose_free/ufo_scene621_pose_free_2s_train.json
 ANNOTATION=$UFO/data/UFO_paper/scene_list/waymo_train.txt
 
 SCENE=segment-5846229052615948000_2120_000_2140_000_with_camera_labels
 
 FIRST=${1:-0}
-LAST=${2:-177}
+LAST=${2:-178}
 
 cd "$UFO"
 source "$ROOT/.venv-moge2/bin/activate"

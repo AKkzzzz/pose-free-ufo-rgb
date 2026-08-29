@@ -327,7 +327,7 @@ def main():
         scope=np.asarray("all"),
         coordinate_frame=np.asarray("global_metric"),
         metric_scale_source=np.asarray(
-            "moge2_gca_plus_overlap_camera_sim3"
+            "moge2_gca_plus_overlap_camera_se3"
         ),
         world_gauge=np.asarray(
             "start_000_first_timestamp_front_camera"
