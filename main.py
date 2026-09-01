@@ -237,6 +237,17 @@ def get_args_parser():
         default="dummy",
     )
     parser.add_argument("--num_motion_tokens", default=16, type=int, help="Number of motion tokens")
+    parser.add_argument("--load_sam_tracks", action="store_true")
+    parser.add_argument("--sam_track_root", type=str, default="outputs/sam_tracks")
+    parser.add_argument("--sam_rigid_min_pixels", type=int, default=32)
+    parser.add_argument("--sam_rigid_max_speed", type=float, default=30.0)
+    parser.add_argument("--sam_dynamic_sigma", type=float, default=0.25)
+    parser.add_argument(
+        "--dynamic_renderer_mode",
+        choices=["bbox", "storm_velocity"],
+        default="bbox",
+        help="bbox: legacy UFO bbox transform; storm_velocity: Gaussian velocity * delta_t.",
+    )
     parser.add_argument("--filter_num", default=3600, type=int, help="Number of visible tokens to keep when filtering scene (k for top-k filtering)")
 
     # =============== Losses =============== #
@@ -256,6 +267,12 @@ def get_args_parser():
     # flow regularization loss
     parser.add_argument("--enable_flow_reg_loss", action="store_true")
     parser.add_argument("--flow_reg_coeff", type=float, default=0.005)
+
+    # Annotation-free local motion coherence.
+    # Penalizes neighboring Gaussians whose predicted velocities diverge.
+    parser.add_argument("--enable_motion_coherence_loss", action="store_true")
+    parser.add_argument("--motion_coherence_coeff", type=float, default=0.001)
+    parser.add_argument("--motion_coherence_beta", type=float, default=0.1)
 
     # lifespan regularization loss (enabled by default)
     parser.add_argument("--enable_lifespan_reg_loss", type=bool, default=True,
@@ -309,6 +326,15 @@ def get_args_parser():
     parser.add_argument("--object_assignment_loss_coeff", type=float, default=0.01)
     parser.add_argument("--object_assignment_background_weight", type=float, default=0.1)
     parser.add_argument("--object_soft_target_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--training_assignment_mode",
+        choices=["predicted", "oracle_bbox"],
+        default="predicted",
+        help=(
+            "Dynamic ownership used during training. "
+            "oracle_bbox assigns each decoded Gaussian directly from GT 3D bbox geometry."
+        ),
+    )
     parser.add_argument(
         "--object_assignment_gt_mode",
         choices=["predicted_mean", "lidar_anchor", "gaussian_coverage"],
@@ -392,6 +418,48 @@ def get_args_parser():
         help="Skip GT flow I/O for training only; evaluation still loads GT flow.",
     )
     parser.add_argument("--skip_sky_mask", action="store_true", help="skip sky mask loading")
+
+    # ============= Pose-free training / camera override ============= #
+    parser.add_argument("--pose_override_dir", type=str, default=None)
+    parser.add_argument(
+        "--pose_override_mode",
+        choices=("none", "context", "all"),
+        default="none",
+    )
+    parser.add_argument("--intrinsics_override_dir", type=str, default=None)
+    parser.add_argument(
+        "--intrinsics_override_mode",
+        choices=("none", "context", "all"),
+        default="none",
+    )
+    parser.add_argument(
+        "--pose_override_sequence_dir",
+        type=str,
+        default=None,
+        help="Root containing start_NNN/<scene>/omega_pose_override.npz",
+    )
+    parser.add_argument(
+        "--intrinsics_override_sequence_dir",
+        type=str,
+        default=None,
+        help="Per-window root containing predicted intrinsics overrides",
+    )
+    parser.add_argument(
+        "--pose_free_camera_only",
+        action="store_true",
+        help="Use predicted cameras and suppress GT-world object trajectories",
+    )
+    parser.add_argument(
+        "--pose_free_coordinate_mode",
+        choices=("identity", "recurrent"),
+        default="identity",
+    )
+    parser.add_argument(
+        "--pose_free_training",
+        action="store_true",
+        help="Enable strict RGB + predicted-camera training contract",
+    )
+
     # ============= Logging ============= #
     parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--num_vis_samples", type=int, default=1)
@@ -598,6 +666,97 @@ def main(args):
         final_config = args_to_dict(args)
         save_config(final_config, os.path.join(log_dir, "config.json"))
         logger.info(f"Saved final configuration to {os.path.join(log_dir, 'config.json')}")
+
+    # ========================================================================
+    # Pose-free training contract
+    # ========================================================================
+
+    if args.pose_free_training:
+        blockers = []
+
+        if not args.pose_free_camera_only:
+            blockers.append("pose_free_camera_only must be enabled")
+        if args.pose_free_coordinate_mode != "recurrent":
+            blockers.append("pose_free_coordinate_mode must be recurrent")
+
+        if args.pose_override_mode != "all":
+            blockers.append("pose_override_mode must be all")
+        if args.intrinsics_override_mode != "all":
+            blockers.append("intrinsics_override_mode must be all")
+
+        if not args.pose_override_dir and not args.pose_override_sequence_dir:
+            blockers.append(
+                "pose_override_dir or pose_override_sequence_dir is required"
+            )
+        if (
+            not args.intrinsics_override_dir
+            and not args.intrinsics_override_sequence_dir
+        ):
+            blockers.append(
+                "intrinsics_override_dir or "
+                "intrinsics_override_sequence_dir is required"
+            )
+
+        forbidden_flags = {
+            "load_depth": args.load_depth,
+            "load_flow": args.load_flow,
+            "load_ground": args.load_ground,
+            "load_dynamic_mask": args.load_dynamic_mask,
+            "enable_depth_loss": args.enable_depth_loss,
+            "enable_sky_depth_loss": args.enable_sky_depth_loss,
+            "enable_sky_opacity_loss": args.enable_sky_opacity_loss,
+        }
+
+        for name, enabled in forbidden_flags.items():
+            if enabled:
+                blockers.append(f"{name} must be disabled")
+
+        if not args.skip_sky_mask:
+            blockers.append("skip_sky_mask must be enabled")
+
+        # v1 deliberately disables the current bbox-motion path because
+        # the public renderer directly consumes GT target_instances_pose.
+        if args.object_assignment_loss_coeff != 0:
+            blockers.append(
+                "object_assignment_loss_coeff must be 0 in pose-free-training v1"
+            )
+
+        if args.paper_bbox_rotation:
+            blockers.append(
+                "paper_bbox_rotation must be disabled in pose-free-training v1"
+            )
+
+        if args.training_sampling_mode != "uniform":
+            blockers.append(
+                "formal pose-free training requires uniform window sampling"
+            )
+
+        if args.dynamic_rich_pool is not None:
+            blockers.append(
+                "dynamic_rich_pool must be null for formal uniform training"
+            )
+
+        if abs(args.dynamic_sampling_ratio) > 1e-8:
+            blockers.append(
+                "dynamic_sampling_ratio must be 0 for formal uniform training"
+            )
+
+        if not args.disable_validation:
+            blockers.append(
+                "validation must be disabled until pose-free validation is wired"
+            )
+
+        if blockers:
+            raise RuntimeError(
+                "POSE_FREE_TRAINING_CONTRACT failed:\n- "
+                + "\n- ".join(blockers)
+            )
+
+        logger.info(
+            "POSE_FREE_TRAINING_CONTRACT PASS: "
+            "RGB + Omega/GCA pose/K only; "
+            "GT depth/flow/ground/sky/dynamic/object trajectory disabled"
+        )
 
     # ========================================================================
     # Dataset initialization
@@ -1030,8 +1189,81 @@ def main(args):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             # Forward pass and loss computation
             loss_total = 0
-            inout_dicts = prepare_inputs_and_targets(data_dict, device, timespan=args.timespan, from_list=True, args=args)
+            inout_dicts = prepare_inputs_and_targets(
+                data_dict,
+                device,
+                timespan=args.timespan,
+                from_list=True,
+                args=args,
+            )
 
+            # Verify the first real training batch, not only CLI flags.
+            if (
+                args.pose_free_training
+                and micro_step
+                == args.start_iteration * args.gradient_accumulation_steps
+            ):
+                forbidden_input = {
+                    "context_depth",
+                    "context_flow",
+                }
+                forbidden_target = {
+                    "target_depth",
+                    "target_flow",
+                    "context_flow",
+                    "target_dynamic_masks",
+                    "target_ground_masks",
+                }
+
+                for chunk_index, (pf_input, pf_target) in enumerate(inout_dicts):
+                    bad_input = forbidden_input & set(pf_input)
+                    bad_target = forbidden_target & set(pf_target)
+
+                    if bad_input or bad_target:
+                        raise RuntimeError(
+                            "POSE_FREE_BATCH_CONTRACT failed at chunk "
+                            f"{chunk_index}: input={sorted(bad_input)}, "
+                            f"target={sorted(bad_target)}"
+                        )
+
+                    # skip_sky_mask currently materializes zero masks rather than
+                    # removing the tensor. Confirm they contain no GT signal.
+                    for name in ("context_sky_masks",):
+                        if name in pf_input and torch.count_nonzero(
+                            pf_input[name]
+                        ).item() != 0:
+                            raise RuntimeError(
+                                f"non-zero {name} found in pose-free batch"
+                            )
+
+                    for name in (
+                        "target_sky_masks",
+                        "context_sky_masks",
+                    ):
+                        if name in pf_target and torch.count_nonzero(
+                            pf_target[name]
+                        ).item() != 0:
+                            raise RuntimeError(
+                                f"non-zero {name} found in pose-free batch"
+                            )
+
+                    # v1 deliberately contains no GT object trajectory.
+                    for name in (
+                        "context_instances_id",
+                        "target_instances_id",
+                    ):
+                        if name in pf_input and torch.count_nonzero(
+                            pf_input[name]
+                        ).item() != 0:
+                            raise RuntimeError(
+                                f"GT object instances leaked through {name}"
+                            )
+
+                logger.info(
+                    "POSE_FREE_TRAINING_BATCH_CONTRACT PASS: "
+                    "%d recurrent chunks checked",
+                    len(inout_dicts),
+                )
 
             all_gs_features = {}
             loss_dict_accum = {}

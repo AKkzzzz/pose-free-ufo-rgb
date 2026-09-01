@@ -30,6 +30,7 @@ from tqdm import trange
 from .constants import DATASET_DICT, DATASETS, MEAN, STD
 from .data_utils import resize_depth, resize_flow, to_float_tensor, to_tensor
 from .pose_override import PoseOverrideStore
+from .sam_tracks import load_sam_track_mask
 from ufo.paper_contract import split_context_supervision
 
 logger = logging.getLogger("UFO")
@@ -124,6 +125,8 @@ class UFODataset(Dataset):
         self.load_depth = load_depth
         self.load_flow = load_flow
         self.load_dynamic_mask = load_dynamic_mask
+        self.load_sam_tracks = getattr(args, "load_sam_tracks", False)
+        self.sam_track_root = getattr(args, "sam_track_root", "outputs/sam_tracks")
         self.load_ground_label = load_ground_label
         self.skip_sky_mask = skip_sky_mask
         self.pose_override_mode = getattr(args, "pose_override_mode", "none")
@@ -132,36 +135,82 @@ class UFODataset(Dataset):
             args, "pose_free_coordinate_mode", "identity"
         )
         pose_override_dir = getattr(args, "pose_override_dir", None)
+        self.pose_override_sequence_dir = getattr(
+            args, "pose_override_sequence_dir", None
+        )
+
         if self.pose_override_mode not in ("none", "context", "all"):
             raise ValueError(f"invalid pose_override_mode={self.pose_override_mode!r}")
-        if self.pose_override_mode != "none" and not pose_override_dir:
-            raise ValueError("pose_override_dir is required when pose_override_mode is enabled")
+
+        if (
+            self.pose_override_mode != "none"
+            and not pose_override_dir
+            and not self.pose_override_sequence_dir
+        ):
+            raise ValueError(
+                "pose_override_dir or pose_override_sequence_dir is required "
+                "when pose override is enabled"
+            )
+
         self.pose_override_store = (
-            PoseOverrideStore(pose_override_dir) if self.pose_override_mode != "none" else None
+            PoseOverrideStore(pose_override_dir)
+            if self.pose_override_mode != "none"
+            and pose_override_dir
+            and not self.pose_override_sequence_dir
+            else None
         )
+
         if self.pose_free_camera_only and self.pose_override_mode != "all":
-            raise ValueError("pose_free_camera_only requires pose_override_mode='all'")
+            raise ValueError(
+                "pose_free_camera_only requires pose_override_mode='all'"
+            )
+
         if self.pose_free_coordinate_mode not in ("identity", "recurrent"):
             raise ValueError(
                 f"invalid pose_free_coordinate_mode={self.pose_free_coordinate_mode!r}"
             )
-        if self.pose_free_coordinate_mode != "identity" and not self.pose_free_camera_only:
+
+        if (
+            self.pose_free_coordinate_mode != "identity"
+            and not self.pose_free_camera_only
+        ):
             raise ValueError(
-                "pose_free_coordinate_mode='recurrent' requires pose_free_camera_only"
+                "pose_free_coordinate_mode='recurrent' "
+                "requires pose_free_camera_only"
             )
-        self.intrinsics_override_mode = getattr(args, "intrinsics_override_mode", "none")
-        intrinsics_override_dir = getattr(args, "intrinsics_override_dir", None)
+
+        self.intrinsics_override_mode = getattr(
+            args, "intrinsics_override_mode", "none"
+        )
+        intrinsics_override_dir = getattr(
+            args, "intrinsics_override_dir", None
+        )
+        self.intrinsics_override_sequence_dir = getattr(
+            args, "intrinsics_override_sequence_dir", None
+        )
+
         if self.intrinsics_override_mode not in ("none", "context", "all"):
             raise ValueError(
-                f"invalid intrinsics_override_mode={self.intrinsics_override_mode!r}"
+                f"invalid intrinsics_override_mode="
+                f"{self.intrinsics_override_mode!r}"
             )
-        if self.intrinsics_override_mode != "none" and not intrinsics_override_dir:
+
+        if (
+            self.intrinsics_override_mode != "none"
+            and not intrinsics_override_dir
+            and not self.intrinsics_override_sequence_dir
+        ):
             raise ValueError(
-                "intrinsics_override_dir is required when intrinsics override is enabled"
+                "intrinsics_override_dir or "
+                "intrinsics_override_sequence_dir is required"
             )
+
         self.intrinsics_override_store = (
             PoseOverrideStore(intrinsics_override_dir)
-            if self.intrinsics_override_mode != "none" else None
+            if self.intrinsics_override_mode != "none"
+            and intrinsics_override_dir
+            and not self.intrinsics_override_sequence_dir
+            else None
         )
         if isinstance(annotation_txt_file_list, str):
             annotation_txt_file_list = [annotation_txt_file_list]
@@ -200,9 +249,9 @@ class UFODataset(Dataset):
         if self.pose_free_camera_only:
             pose = self.pose_override_store.get(scene_json["scene_name"], frame_idx, camera)
             frame = self.pose_override_store.coordinate_frame(scene_json["scene_name"])
-            if frame != "rig_local_metric":
+            if frame not in ("rig_local_metric", "global_metric"):
                 raise ValueError(
-                    "pose_free_camera_only requires a rig_local_metric override, "
+                    "pose_free_camera_only requires metric camera overrides, "
                     f"got {frame!r}"
                 )
             return pose
@@ -313,6 +362,7 @@ class UFODataset(Dataset):
         images, depths, sky_masks, flows = [], [], [], []
         camtoworlds, intrinsics = [], []
         dynamic_masks, ground_masks = [], []
+        sam_track_ids = []
 
         camtoworlds_global = []
 
@@ -342,7 +392,7 @@ class UFODataset(Dataset):
             world_to_canonical = np.linalg.inv(c2w_real_cur_frame)
             world_to_canonical_global = np.linalg.inv(c2w_real_global)
 
-        for camera in camera_list:
+        for camera_slot, camera in enumerate(camera_list):
             frame_camera_to_world = self._camera_to_world(
                 scene_json, camera, frame_idx, pose_role
             )
@@ -357,6 +407,18 @@ class UFODataset(Dataset):
             img = Image.open(img_path).convert("RGB")
             img = self.img_transformation(img)
             images.append(img)
+
+            if self.load_sam_tracks:
+                sam_track_ids.append(
+                    load_sam_track_mask(
+                        self.sam_track_root,
+                        scene_json["scene_name"],
+                        camera,
+                        frame_idx,
+                        self.target_size,
+                        camera_slot=camera_slot,
+                    )
+                )
 
             # Get sky mask
             if dataset_name in ["waymo", "nuscenes", "argoverse2"]:
@@ -533,6 +595,9 @@ class UFODataset(Dataset):
         frame_sky_masks = torch.stack(sky_masks) if len(sky_masks) > 0 else None
         frame_flows = torch.stack(flows) if len(flows) > 0 else None
         frame_dynamic_masks = torch.stack(dynamic_masks) if len(dynamic_masks) > 0 else None
+        frame_sam_track_ids = (
+            torch.stack(sam_track_ids) if len(sam_track_ids) > 0 else None
+        )
         frame_camtoworlds = torch.stack(camtoworlds)
         frame_camtoworlds_global = torch.stack(camtoworlds_global)
         frame_intrinsics = torch.stack(intrinsics)
@@ -549,6 +614,7 @@ class UFODataset(Dataset):
             "sky_masks": frame_sky_masks,
             "flow": frame_flows,
             "dynamic_masks": frame_dynamic_masks,
+            "sam_track_ids": frame_sam_track_ids,
             "ground_masks": ground_masks,
             "instances_corner": instances_corner_ts,
             "instances_corner_local": instances_corner_local_ts,
@@ -584,14 +650,43 @@ class UFODataset(Dataset):
             
             # Store the initial starting frame (rename to avoid confusion)
             if context_frame_idx < 0:
-                initial_start_frame = np.random.randint(0, max(1, num_timesteps - num_max_future_frames))
+                initial_start_frame = np.random.randint(
+                    0,
+                    max(1, num_timesteps - num_max_future_frames + 1),
+                )
             else:
                 initial_start_frame = context_frame_idx
                 
             # Validate and adjust if necessary
             if initial_start_frame + num_max_future_frames > num_timesteps:
-                initial_start_frame = np.random.randint(0, max(1, num_timesteps - num_max_future_frames))
-            
+                initial_start_frame = np.random.randint(
+                    0, max(1, num_timesteps - num_max_future_frames + 1)
+                )
+
+            # Pose-free training uses precomputed RGB-only Omega+GCA
+            # camera predictions for the exact sampled 20-frame window.
+            if (
+                self.pose_override_mode != "none"
+                and self.pose_override_sequence_dir
+            ):
+                pose_root = (
+                    Path(self.pose_override_sequence_dir)
+                    / f"start_{initial_start_frame:03d}"
+                )
+                self.pose_override_store = PoseOverrideStore(pose_root)
+
+            if (
+                self.intrinsics_override_mode != "none"
+                and self.intrinsics_override_sequence_dir
+            ):
+                intrinsics_root = (
+                    Path(self.intrinsics_override_sequence_dir)
+                    / f"start_{initial_start_frame:03d}"
+                )
+                self.intrinsics_override_store = PoseOverrideStore(
+                    intrinsics_root
+                )
+
             value_list = []
             
             first_context_idx = None
@@ -606,17 +701,32 @@ class UFODataset(Dataset):
                 )
                 if not override_frames:
                     raise ValueError("pose-free override contains no frames")
-                global_reference_frame_idx = override_frames[-1]
-                if not (
-                    initial_start_frame
-                    <= global_reference_frame_idx
-                    < last_frame_idx
-                ):
-                    raise ValueError(
-                        "pose-free global reference must lie inside the current "
-                        f"window [{initial_start_frame}, {last_frame_idx}); got "
-                        f"{global_reference_frame_idx}"
+
+                override_frame = self.pose_override_store.coordinate_frame(
+                    scene_json["scene_name"]
+                )
+
+                if override_frame == "global_metric":
+                    # One global trajectory covers the complete scene.
+                    # Canonicalize only with respect to the current training
+                    # sample; do not use the final frame of the whole scene.
+                    global_reference_frame_idx = min(
+                        last_frame_idx - 1,
+                        num_timesteps - 1,
                     )
+                else:
+                    # Legacy per-window Omega gauge.
+                    global_reference_frame_idx = override_frames[-1]
+                    if not (
+                        initial_start_frame
+                        <= global_reference_frame_idx
+                        < last_frame_idx
+                    ):
+                        raise ValueError(
+                            "pose-free global reference must lie inside the current "
+                            f"window [{initial_start_frame}, {last_frame_idx}); got "
+                            f"{global_reference_frame_idx}"
+                        )
 
             # get all possible instances
             frame_instances = scene_json['frame_instances']

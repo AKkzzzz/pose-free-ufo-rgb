@@ -1282,10 +1282,12 @@ class UFO(ViT):
             t=t,
             v=v,
         )
-        assignment_mode = getattr(self.args, "inference_assignment_mode", "predicted")
+        assignment_mode = (
+            getattr(self.args, "training_assignment_mode", "predicted")
+            if self.training
+            else getattr(self.args, "inference_assignment_mode", "predicted")
+        )
         if assignment_mode != "predicted":
-            if self.training:
-                raise RuntimeError("inference assignment overrides cannot be used for training")
             if assignment_mode != "oracle_bbox":
                 raise ValueError(f"unsupported inference_assignment_mode={assignment_mode!r}")
             gaussian_means = rearrange(
@@ -1431,6 +1433,41 @@ class UFO(ViT):
         opacities = rearrange(gs_params["opacities"], "b t v h w -> b (t v h w)")
         colors = rearrange(gs_params["colors"], "b t v h w c -> b (t v h w) c")
         forward_v = rearrange(gs_params["forward_flow"], "b t v h w c -> b (t v h w) c") if 'forward_flow' in gs_params.keys() else torch.zeros_like(means)
+
+        # R4: RGB-derived SAM track -> object-level rigid translation.
+        renderer_mode = getattr(self.args, "dynamic_renderer_mode", "bbox")
+        sam_track_ids_dense = None
+
+        if renderer_mode == "sam_rigid":
+            from ufo.models.sam_rigid_motion import fit_track_rigid_velocity
+
+            sam_track_ids_dense = data_dict.get("sam_track_ids")
+            if sam_track_ids_dense is None:
+                raise RuntimeError(
+                    "dynamic_renderer_mode='sam_rigid' requires sam_track_ids"
+                )
+
+            rigid_velocity, sam_diag = fit_track_rigid_velocity(
+                gs_params["means"],
+                sam_track_ids_dense,
+                data_dict["gs_time"],
+                data_dict["timespan"],
+                min_pixels=getattr(self.args, "sam_rigid_min_pixels", 32),
+                max_speed=getattr(self.args, "sam_rigid_max_speed", 30.0),
+            )
+
+            # Completely replace learned per-Gaussian velocity.
+            forward_v = rearrange(
+                rigid_velocity,
+                "b t v h w c -> b (t v h w) c",
+            )
+
+            for key, value in sam_diag.items():
+                data_dict[key] = torch.as_tensor(
+                    value,
+                    device=means.device,
+                    dtype=torch.float32,
+                )
 
         lifespan = rearrange(gs_params['lifespan'], "b t v h w c -> b (t v h w) c")
         ### transform gaussian means
@@ -1761,6 +1798,30 @@ class UFO(ViT):
             forward_translation = forward_v_batched[:, :ntk_dynamic] * tdiff_forward_batched
             means_batched[:, :ntk_dynamic] = means_batched[:, :ntk_dynamic] + forward_translation
 
+        # R4 transient dynamic representation:
+        # dynamic copies far from the target timestamp gradually disappear.
+        if renderer_mode == "sam_rigid":
+            from ufo.models.sam_rigid_motion import apply_sam_temporal_gate
+
+            sam_ids_batched = (
+                sam_track_ids_dense.reshape(b, -1)
+                .repeat_interleave(tgt_t, dim=0)
+            )
+
+            if sam_ids_batched.shape[1] != opacities_batched.shape[1]:
+                raise RuntimeError(
+                    "SAM/Gaussian flattened-size mismatch: "
+                    f"sam={sam_ids_batched.shape}, "
+                    f"opacity={opacities_batched.shape}"
+                )
+
+            opacities_batched = apply_sam_temporal_gate(
+                opacities_batched,
+                sam_ids_batched,
+                tdiff_forward_batched.squeeze(-1),
+                sigma=getattr(self.args, "sam_dynamic_sigma", 0.25),
+            )
+
 
         ### lifespan for opacity
         if self.args.enable_lifespan_renderer:
@@ -1799,8 +1860,11 @@ class UFO(ViT):
         motion_assignment_weights = None
 
 
-        # replace means batched 
-        means_batched = transformed_means
+        # Legacy UFO used bbox/object poses to overwrite the velocity-warped
+        # Gaussian centers here. In STORM mode the only geometric motion is
+        # continuous per-Gaussian velocity * delta_t.
+        if getattr(self.args, "dynamic_renderer_mode", "bbox") == "bbox":
+            means_batched = transformed_means
 
 
 
@@ -2112,12 +2176,53 @@ class UFO(ViT):
 
         gs_params = self.forward_gs_predictor(x, data_dict['gs_origins'], data_dict['gs_dirs'])
 
-        # if self.num_motion_tokens > 0 and not self.static:
-        if motion:
-            data_dict = self.forward_motion_predictor_bbox(data_dict, gs_params)
+        dynamic_mode = getattr(self.args, "dynamic_renderer_mode", "bbox")
+
+        if dynamic_mode == "storm_velocity":
+            if self.num_motion_tokens <= 0:
+                raise RuntimeError(
+                    "storm_velocity requires num_motion_tokens > 0"
+                )
+
+            motion_tokens = data_dict.get("motion_tokens")
+            if motion_tokens is None:
+                raise RuntimeError(
+                    "storm_velocity requires motion_tokens from stage-1"
+                )
+
+            # STORM:
+            # image/scene features + motion tokens
+            # -> motion bases + per-Gaussian weights
+            # -> per-Gaussian velocity
+            gs_params = self.forward_motion_predictor(
+                x,
+                motion_tokens,
+                gs_params,
+            )
+
+            # Keep the existing bbox branch only as compatibility bookkeeping.
+            # In pose_free_camera_only mode all GT instances are suppressed and
+            # object_assignment_loss_coeff=0, so it cannot control motion.
+            if motion or 'bbox_weights' not in data_dict:
+                data_dict = self.forward_motion_predictor_bbox(
+                    data_dict,
+                    gs_params,
+                )
+
+        elif motion:
+            data_dict = self.forward_motion_predictor_bbox(
+                data_dict,
+                gs_params,
+            )
+
         else:
             assert 'bbox_weights' in data_dict
-            if getattr(self.args, "inference_assignment_mode", "predicted") == "oracle_bbox":
+            assignment_mode = (
+                getattr(self.args, "training_assignment_mode", "predicted")
+                if self.training
+                else getattr(self.args, "inference_assignment_mode", "predicted")
+            )
+            if assignment_mode == "oracle_bbox":
                 b, t, v, h, w, _ = gs_params["means"].shape
                 gaussian_means = rearrange(
                     gs_params["means"], "b t v h w c -> b t (v h w) c"

@@ -283,6 +283,11 @@ def prepare_inputs_and_targets(data_dict, device=torch.device("cuda"), v=3, time
         input_dict["context_sky_masks"] = data_dict["context"]["sky_masks"].reshape(
             b, context_t, v, h, w
         )
+
+    if "sam_track_ids" in data_dict["context"]:
+        input_dict["sam_track_ids"] = data_dict["context"]["sam_track_ids"].reshape(
+            b, context_t, v, h, w
+        ).long()
     target_dict = {
         "target_image": data_dict["target"]["image"].reshape(b, target_t, v, 3, h, w),
     }
