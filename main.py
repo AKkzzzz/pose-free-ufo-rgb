@@ -242,9 +242,29 @@ def get_args_parser():
     parser.add_argument("--sam_rigid_min_pixels", type=int, default=32)
     parser.add_argument("--sam_rigid_max_speed", type=float, default=30.0)
     parser.add_argument("--sam_dynamic_sigma", type=float, default=0.25)
+
+    parser.add_argument(
+        "--sam_motion_hidden_dim",
+        type=int,
+        default=384,
+    )
+    parser.add_argument(
+        "--sam_motion_max_speed",
+        type=float,
+        default=20.0,
+    )
+    parser.add_argument(
+        "--sam_motion_min_observations",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--train_sam_motion_only",
+        action="store_true",
+    )
     parser.add_argument(
         "--dynamic_renderer_mode",
-        choices=["bbox", "storm_velocity"],
+        choices=["bbox", "storm_velocity", "sam_rigid", "sam_object_motion"],
         default="bbox",
         help="bbox: legacy UFO bbox transform; storm_velocity: Gaussian velocity * delta_t.",
     )
@@ -952,6 +972,50 @@ def main(args):
         num_mem_tokens=args.num_mem_tokens,
         args=args
     )
+
+    if getattr(
+        args,
+        "train_sam_motion_only",
+        False,
+    ):
+
+        if getattr(
+            model,
+            "sam_object_motion_head",
+            None,
+        ) is None:
+            raise RuntimeError(
+                "train_sam_motion_only requires "
+                "dynamic_renderer_mode="
+                "sam_object_motion"
+            )
+
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+
+        for parameter in (
+            model.sam_object_motion_head
+            .parameters()
+        ):
+            parameter.requires_grad = True
+
+        trainable_names = [
+            name
+            for name, parameter
+            in model.named_parameters()
+            if parameter.requires_grad
+        ]
+
+        logger.info(
+            "SAM_OBJECT_MOTION_ONLY: "
+            "%d trainable tensors",
+            len(trainable_names),
+        )
+
+        logger.info(
+            "Trainable parameters: %s",
+            trainable_names,
+        )
 
     logger.info(f"Model = {str(model)}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

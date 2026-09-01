@@ -124,6 +124,44 @@ def compute_lifespan_reg_loss(gs_params, parameterization="official_precision"):
     return torch.abs(lifespan).mean()
 
 
+def compute_motion_coherence_loss(forward_flow, beta=0.1):
+    """
+    Annotation-free local velocity coherence.
+
+    forward_flow:
+        [B, T, V, H, W, 3]
+
+    Adjacent Gaussians should normally have similar velocities.
+    Smooth-L1 keeps the prior robust at real motion boundaries.
+    """
+    if forward_flow.ndim != 6:
+        raise ValueError(
+            f"Expected forward_flow [B,T,V,H,W,3], got {forward_flow.shape}"
+        )
+
+    dy = (
+        forward_flow[:, :, :, 1:, :, :]
+        - forward_flow[:, :, :, :-1, :, :]
+    )
+    dx = (
+        forward_flow[:, :, :, :, 1:, :]
+        - forward_flow[:, :, :, :, :-1, :]
+    )
+
+    loss_y = F.smooth_l1_loss(
+        dy,
+        torch.zeros_like(dy),
+        beta=beta,
+    )
+    loss_x = F.smooth_l1_loss(
+        dx,
+        torch.zeros_like(dx),
+        beta=beta,
+    )
+
+    return 0.5 * (loss_x + loss_y)
+
+
 def compute_loss(output_dict, target_dict, args=None, lpips_loss=None):
     gs_params, pred_dict = output_dict["gs_params"], output_dict["render_results"]
     device = pred_dict[pred_dict["rgb_key"]].device
@@ -172,6 +210,34 @@ def compute_loss(output_dict, target_dict, args=None, lpips_loss=None):
             # Full bbox motion in public v1 never produces forward_flow. Keep the
             # requested metric visible without inventing the paper's missing head.
             loss_dict["flow_reg_loss"] = pred_rgb.sum() * 0.0
+
+    # STORM velocity diagnostics. These entries do not contain "loss",
+    # therefore main.py logs them but does not add them to the objective.
+    if "forward_flow" in gs_params:
+        motion_speed = gs_params["forward_flow"].float().norm(dim=-1)
+        loss_dict["motion_speed_mean"] = motion_speed.mean().detach()
+        loss_dict["motion_speed_max"] = motion_speed.max().detach()
+        loss_dict["motion_speed_gt_0p5_ratio"] = (
+            motion_speed > 0.5
+        ).float().mean().detach()
+        loss_dict["motion_speed_gt_1p0_ratio"] = (
+            motion_speed > 1.0
+        ).float().mean().detach()
+
+    # R3: annotation-free local motion coherence
+    if getattr(args, "enable_motion_coherence_loss", False):
+        if "forward_flow" in gs_params:
+            motion_coherence_raw = compute_motion_coherence_loss(
+                gs_params["forward_flow"],
+                beta=getattr(args, "motion_coherence_beta", 0.1),
+            )
+            loss_dict["motion_coherence_loss"] = (
+                getattr(args, "motion_coherence_coeff", 0.001)
+                * motion_coherence_raw
+            )
+            loss_dict["motion_coherence_raw"] = motion_coherence_raw.detach()
+        else:
+            loss_dict["motion_coherence_loss"] = pred_rgb.sum() * 0.0
 
     # Lifespan L1 regularization: encourages persistent Gaussians (low lifespan)
     # L1 provides "selection functionality" - most Gaussians persistent, few can be transient

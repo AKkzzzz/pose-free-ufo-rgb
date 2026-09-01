@@ -209,7 +209,7 @@ def build_dataset(args):
     dataset = UFODataset(
         data_root=args.data_root,
         annotation_txt_file_list=val_annotation,
-        subset_indices=[args.scene_id] if args.annotation_file else None,
+        subset_indices=None if args.annotation_file else [args.scene_id],
         target_size=args.input_size,
         equispaced=True,
         num_context_timesteps=args.num_context_timesteps,

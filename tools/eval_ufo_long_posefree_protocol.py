@@ -462,16 +462,23 @@ def main():
         for x in mapping
     ]
 
-    if len(source_frames) != scene_frames:
-        raise RuntimeError(
-            f"Expected {scene_frames} frames, "
-            f"got {len(source_frames)}"
-        )
+    full_protocol_starts = [
+        0, 20, 40, 60, 80,
+        100, 120, 140, 160, 178,
+    ]
 
-    if source_frames != list(range(scene_frames)):
-        raise RuntimeError(
-            "Rendered frames are not exactly 0..197"
-        )
+    # Strict continuity check only for the official full198 protocol.
+    if list(args.start_indices) == full_protocol_starts:
+        if len(source_frames) != scene_frames:
+            raise RuntimeError(
+                f"Expected {scene_frames} frames, "
+                f"got {len(source_frames)}"
+            )
+
+        if source_frames != list(range(scene_frames)):
+            raise RuntimeError(
+                "Rendered frames are not exactly 0..197"
+            )
 
     summary = {
         "checkpoint": str(

@@ -658,6 +658,35 @@ class UFO(ViT):
         self.enable_mem_gs = False
         self.args = args
 
+        # R4: RGB-derived SAM object-level motion.
+        self.sam_object_motion_head = None
+
+        if getattr(
+            args,
+            "dynamic_renderer_mode",
+            "bbox",
+        ) == "sam_object_motion":
+
+            from ufo.models.sam_object_motion import (
+                SAMObjectMotionHead,
+            )
+
+            self.sam_object_motion_head = (
+                SAMObjectMotionHead(
+                    embed_dim=embed_dim,
+                    hidden_dim=getattr(
+                        args,
+                        "sam_motion_hidden_dim",
+                        384,
+                    ),
+                    max_speed=getattr(
+                        args,
+                        "sam_motion_max_speed",
+                        20.0,
+                    ),
+                )
+            )
+
         self.num_heads = num_heads
 
         self.static = static
@@ -1439,24 +1468,185 @@ class UFO(ViT):
         sam_track_ids_dense = None
 
         if renderer_mode == "sam_rigid":
-            from ufo.models.sam_rigid_motion import fit_track_rigid_velocity
+            from ufo.models.sam_rigid_motion import rigidify_learned_velocity
 
             sam_track_ids_dense = data_dict.get("sam_track_ids")
+
             if sam_track_ids_dense is None:
                 raise RuntimeError(
                     "dynamic_renderer_mode='sam_rigid' requires sam_track_ids"
                 )
 
-            rigid_velocity, sam_diag = fit_track_rigid_velocity(
-                gs_params["means"],
+            if "forward_flow" not in gs_params:
+                raise RuntimeError(
+                    "sam_rigid requires R3 learned forward_flow"
+                )
+
+            # ----------------------------------------------------------
+            # R4 diagnostic: inspect the RAW R3 velocity before rigidification.
+            # Do not change any motion here.
+            # ----------------------------------------------------------
+            with torch.no_grad():
+                raw_flow_dbg = gs_params["forward_flow"].detach().float()
+                raw_speed_dbg = raw_flow_dbg.norm(dim=-1)
+                sam_mask_dbg = sam_track_ids_dense > 0
+
+                def _stats(name, values):
+                    values = values[torch.isfinite(values)]
+                    if values.numel() == 0:
+                        print(f"[R4 raw-flow] {name}: EMPTY")
+                        return
+
+                    q = torch.quantile(
+                        values,
+                        torch.tensor(
+                            [0.50, 0.90, 0.95, 0.99, 0.999],
+                            device=values.device,
+                        ),
+                    )
+
+                    print(
+                        f"[R4 raw-flow] {name}: "
+                        f"N={values.numel()} "
+                        f"q50={q[0].item():.4f} "
+                        f"q90={q[1].item():.4f} "
+                        f"q95={q[2].item():.4f} "
+                        f"q99={q[3].item():.4f} "
+                        f"q999={q[4].item():.4f} "
+                        f"max={values.max().item():.4f} "
+                        f">0.3={(values > 0.3).float().mean().item():.4f} "
+                        f">0.5={(values > 0.5).float().mean().item():.4f} "
+                        f">1.0={(values > 1.0).float().mean().item():.4f}"
+                    )
+
+                _stats("ALL", raw_speed_dbg.flatten())
+                _stats("SAM", raw_speed_dbg[sam_mask_dbg])
+
+                # Track-level diagnostics.
+                rows = []
+
+                for tid in torch.unique(sam_track_ids_dense):
+                    tid_i = int(tid.item())
+
+                    if tid_i == 0:
+                        continue
+
+                    mask = sam_track_ids_dense == tid
+
+                    if int(mask.sum()) < 32:
+                        continue
+
+                    vv = raw_flow_dbg[mask]
+                    ss = vv.norm(dim=-1)
+
+                    finite = torch.isfinite(ss)
+                    vv = vv[finite]
+                    ss = ss[finite]
+
+                    if ss.numel() < 32:
+                        continue
+
+                    qs = torch.quantile(
+                        ss,
+                        torch.tensor(
+                            [0.50, 0.90, 0.95, 0.99],
+                            device=ss.device,
+                        ),
+                    )
+
+                    active = ss > 0.5
+
+                    if active.any():
+                        av = vv[active]
+
+                        dirs = torch.nn.functional.normalize(
+                            av,
+                            dim=-1,
+                            eps=1e-6,
+                        )
+
+                        direction_coherence = float(
+                            dirs.mean(dim=0).norm()
+                        )
+
+                        active_median_v = av.median(dim=0).values
+                        active_median_speed = float(
+                            active_median_v.norm()
+                        )
+                    else:
+                        direction_coherence = 0.0
+                        active_median_speed = 0.0
+
+                    rows.append(
+                        (
+                            float(qs[3]),
+                            tid_i,
+                            int(ss.numel()),
+                            float(qs[0]),
+                            float(qs[1]),
+                            float(qs[2]),
+                            float(qs[3]),
+                            float(ss.max()),
+                            float(active.float().mean()),
+                            active_median_speed,
+                            direction_coherence,
+                        )
+                    )
+
+                rows.sort(reverse=True)
+
+                for row in rows[:12]:
+                    (
+                        q99,
+                        tid_i,
+                        n,
+                        q50,
+                        q90,
+                        q95,
+                        q99,
+                        vmax,
+                        ratio05,
+                        seed_speed,
+                        coherence,
+                    ) = row
+
+                    print(
+                        f"[R4 track] id={tid_i} N={n} "
+                        f"q50={q50:.3f} "
+                        f"q90={q90:.3f} "
+                        f"q95={q95:.3f} "
+                        f"q99={q99:.3f} "
+                        f"max={vmax:.3f} "
+                        f"ratio>0.5={ratio05:.4f} "
+                        f"seed_speed={seed_speed:.3f} "
+                        f"dir_coh={coherence:.3f}"
+                    )
+
+            rigid_velocity, sam_diag = rigidify_learned_velocity(
+                gs_params["forward_flow"],
                 sam_track_ids_dense,
-                data_dict["gs_time"],
-                data_dict["timespan"],
-                min_pixels=getattr(self.args, "sam_rigid_min_pixels", 32),
-                max_speed=getattr(self.args, "sam_rigid_max_speed", 30.0),
+                min_pixels=getattr(
+                    self.args, "sam_rigid_min_pixels", 32
+                ),
+                seed_speed=getattr(
+                    self.args, "sam_seed_speed", 0.5
+                ),
+                min_seed_count=getattr(
+                    self.args, "sam_seed_min_count", 4
+                ),
+                min_seed_ratio=getattr(
+                    self.args, "sam_seed_min_ratio", 0.02
+                ),
+                min_coherence=getattr(
+                    self.args, "sam_seed_min_coherence", 0.70
+                ),
+                max_speed=getattr(
+                    self.args, "sam_rigid_max_speed", 30.0
+                ),
             )
 
-            # Completely replace learned per-Gaussian velocity.
+            # Replace independent Gaussian velocities
+            # with one shared velocity per SAM track.
             forward_v = rearrange(
                 rigid_velocity,
                 "b t v h w c -> b (t v h w) c",
@@ -1467,6 +1657,18 @@ class UFO(ViT):
                     value,
                     device=means.device,
                     dtype=torch.float32,
+                )
+
+
+        if renderer_mode == "sam_object_motion":
+            sam_track_ids_dense = data_dict.get(
+                "sam_track_ids"
+            )
+
+            if sam_track_ids_dense is None:
+                raise RuntimeError(
+                    "sam_object_motion renderer "
+                    "requires sam_track_ids"
                 )
 
         lifespan = rearrange(gs_params['lifespan'], "b t v h w c -> b (t v h w) c")
@@ -1800,7 +2002,7 @@ class UFO(ViT):
 
         # R4 transient dynamic representation:
         # dynamic copies far from the target timestamp gradually disappear.
-        if renderer_mode == "sam_rigid":
+        if renderer_mode == "sam_rigid" and getattr(self.args, "enable_sam_temporal_gate", False):
             from ufo.models.sam_rigid_motion import apply_sam_temporal_gate
 
             sam_ids_batched = (
@@ -1825,18 +2027,77 @@ class UFO(ViT):
 
         ### lifespan for opacity
         if self.args.enable_lifespan_renderer:
+
             if self.args.lifespan_parameterization == "paper_beta":
-                # Paper beta is a temporal standard deviation: exp(-dt^2 / (2 beta^2)).
+
                 temporal_opacity = torch.exp(
-                    -0.5 * tdiff_forward_batched ** 2 / lifespan_batched.clamp_min(1e-6).square()
+                    -0.5
+                    * tdiff_forward_batched ** 2
+                    / lifespan_batched
+                    .clamp_min(1e-6)
+                    .square()
                 )
+
             else:
-                # Official v1 variable acts as temporal precision despite its lifespan name.
+
                 temporal_opacity = torch.exp(
-                    -0.5 * tdiff_forward_batched ** 2 * lifespan_batched
+                    -0.5
+                    * tdiff_forward_batched ** 2
+                    * lifespan_batched
                 )
-            opacities_batched = opacities_batched * temporal_opacity.squeeze(-1)
-            
+
+            temporal_opacity = (
+                temporal_opacity.squeeze(-1)
+            )
+
+            # --------------------------------------------------
+            # R4:
+            # do not solve dynamic motion by making old/new
+            # vehicle copies disappear.
+            #
+            # Background still uses R3 lifespan.
+            # SAM-track Gaussians must stay visible and become
+            # aligned through object-level velocity.
+            # --------------------------------------------------
+            if (
+                renderer_mode
+                == "sam_object_motion"
+                and sam_track_ids_dense
+                is not None
+            ):
+
+                sam_dynamic = (
+                    sam_track_ids_dense
+                    .reshape(b, -1)
+                    .repeat_interleave(
+                        tgt_t,
+                        dim=0,
+                    )
+                    > 0
+                )
+
+                if (
+                    sam_dynamic.shape
+                    != temporal_opacity.shape
+                ):
+                    raise RuntimeError(
+                        "SAM/lifespan shape mismatch: "
+                        f"{sam_dynamic.shape} vs "
+                        f"{temporal_opacity.shape}"
+                    )
+
+                temporal_opacity = torch.where(
+                    sam_dynamic,
+                    torch.ones_like(
+                        temporal_opacity
+                    ),
+                    temporal_opacity,
+                )
+
+            opacities_batched = (
+                opacities_batched
+                * temporal_opacity
+            )
 
 
         if not self.training:  # mask out some noisy flow
@@ -2178,7 +2439,67 @@ class UFO(ViT):
 
         dynamic_mode = getattr(self.args, "dynamic_renderer_mode", "bbox")
 
-        if dynamic_mode == "storm_velocity":
+        if dynamic_mode == "sam_object_motion":
+
+            from ufo.models.sam_object_motion import (
+                predict_sam_object_velocity,
+            )
+
+            if self.sam_object_motion_head is None:
+                raise RuntimeError(
+                    "sam_object_motion head "
+                    "was not initialized"
+                )
+
+            forward_flow, sam_diag = (
+                predict_sam_object_velocity(
+                    gs_state=x,
+                    sam_track_ids=data_dict.get(
+                        "sam_track_ids"
+                    ),
+                    gs_time=data_dict["gs_time"],
+                    timespan=data_dict["timespan"],
+                    motion_head=(
+                        self.sam_object_motion_head
+                    ),
+                    patch_size=self.unpatch_size,
+                    min_observations=getattr(
+                        self.args,
+                        "sam_motion_min_observations",
+                        2,
+                    ),
+                )
+            )
+
+            gs_params["forward_flow"] = (
+                forward_flow
+            )
+
+            for key, value in sam_diag.items():
+                if torch.is_tensor(value):
+                    data_dict[key] = value
+                else:
+                    data_dict[key] = torch.tensor(
+                        float(value),
+                        device=x.device,
+                    )
+
+            # Legacy bbox information remains only because
+            # forward_renderer currently expects these fields.
+            # It does NOT control motion in this mode.
+            if "bbox_weights" not in data_dict:
+                data_dict = (
+                    self.forward_motion_predictor_bbox(
+                        data_dict,
+                        gs_params,
+                    )
+                )
+
+
+        # Both modes use the trained R3/STORM velocity head.
+        # sam_rigid only changes how per-Gaussian velocity is aggregated
+        # before rendering; it must NOT bypass velocity prediction.
+        elif dynamic_mode in ("storm_velocity", "sam_rigid"):
             if self.num_motion_tokens <= 0:
                 raise RuntimeError(
                     "storm_velocity requires num_motion_tokens > 0"

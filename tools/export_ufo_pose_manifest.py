@@ -109,15 +109,6 @@ def main():
                         raise ValueError(f"duplicate manifest image {key}")
                     seen.add(key)
                     relative_path = scene_json["relative_image_path"][camera_id][frame_id]
-                    fx, fy, cx, cy = np.asarray(
-                        scene_json["normalized_intrinsics"][camera_id], dtype=np.float64
-                    )
-                    height, width = config["input_size"]
-                    gt_intrinsics = np.asarray([
-                        [fx * width, 0.0, cx * width],
-                        [0.0, fy * height, cy * height],
-                        [0.0, 0.0, 1.0],
-                    ])
                     entry = {
                         "frame_id": frame_id,
                         "camera_id": camera_id,
@@ -125,11 +116,17 @@ def main():
                         "chunk_index": chunk_index,
                         "path": str(image_path(cli.data_root, dataset_name, relative_path).resolve()),
                     }
-                    entry[
-                        "calibrated_intrinsics_ufo" if cli.rig_pose_free
-                        else "gt_intrinsics_ufo"
-                    ] = gt_intrinsics.tolist()
                     if not cli.rig_pose_free:
+                        fx, fy, cx, cy = np.asarray(
+                            scene_json["normalized_intrinsics"][camera_id], dtype=np.float64
+                        )
+                        height, width = config["input_size"]
+                        gt_intrinsics = np.asarray([
+                            [fx * width, 0.0, cx * width],
+                            [0.0, fy * height, cy * height],
+                            [0.0, 0.0, 1.0],
+                        ])
+                        entry["gt_intrinsics_ufo"] = gt_intrinsics.tolist()
                         gt_native = np.asarray(
                             scene_json["camera_to_world"][camera_id][frame_id],
                             dtype=np.float64,

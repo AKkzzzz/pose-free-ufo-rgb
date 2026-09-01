@@ -305,7 +305,11 @@ def load_model(args, model_without_ddp, optimizer=None, loss_scaler=None):
         # this is useful for loading a model without optimizer and scheduler states
         # or for loading a pre-trained model for initialization, fine-tuning, or evaluation.
         logger.info(f"Loading checkpoint from: {args.load_from}")
-        checkpoint = torch.load(args.load_from)
+        checkpoint = torch.load(
+            args.load_from,
+            map_location="cpu",
+            weights_only=False,
+        )
         if "model" in checkpoint:
             checkpoint = checkpoint["model"]
         try:
