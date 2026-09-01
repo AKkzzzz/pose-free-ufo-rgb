@@ -237,6 +237,17 @@ def get_args_parser():
         default="dummy",
     )
     parser.add_argument("--num_motion_tokens", default=16, type=int, help="Number of motion tokens")
+    parser.add_argument("--load_sam_tracks", action="store_true")
+    parser.add_argument("--sam_track_root", type=str, default="outputs/sam_tracks")
+    parser.add_argument("--sam_rigid_min_pixels", type=int, default=32)
+    parser.add_argument("--sam_rigid_max_speed", type=float, default=30.0)
+    parser.add_argument("--sam_dynamic_sigma", type=float, default=0.25)
+    parser.add_argument(
+        "--dynamic_renderer_mode",
+        choices=["bbox", "storm_velocity"],
+        default="bbox",
+        help="bbox: legacy UFO bbox transform; storm_velocity: Gaussian velocity * delta_t.",
+    )
     parser.add_argument("--filter_num", default=3600, type=int, help="Number of visible tokens to keep when filtering scene (k for top-k filtering)")
 
     # =============== Losses =============== #
@@ -256,6 +267,12 @@ def get_args_parser():
     # flow regularization loss
     parser.add_argument("--enable_flow_reg_loss", action="store_true")
     parser.add_argument("--flow_reg_coeff", type=float, default=0.005)
+
+    # Annotation-free local motion coherence.
+    # Penalizes neighboring Gaussians whose predicted velocities diverge.
+    parser.add_argument("--enable_motion_coherence_loss", action="store_true")
+    parser.add_argument("--motion_coherence_coeff", type=float, default=0.001)
+    parser.add_argument("--motion_coherence_beta", type=float, default=0.1)
 
     # lifespan regularization loss (enabled by default)
     parser.add_argument("--enable_lifespan_reg_loss", type=bool, default=True,
@@ -309,6 +326,15 @@ def get_args_parser():
     parser.add_argument("--object_assignment_loss_coeff", type=float, default=0.01)
     parser.add_argument("--object_assignment_background_weight", type=float, default=0.1)
     parser.add_argument("--object_soft_target_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--training_assignment_mode",
+        choices=["predicted", "oracle_bbox"],
+        default="predicted",
+        help=(
+            "Dynamic ownership used during training. "
+            "oracle_bbox assigns each decoded Gaussian directly from GT 3D bbox geometry."
+        ),
+    )
     parser.add_argument(
         "--object_assignment_gt_mode",
         choices=["predicted_mean", "lidar_anchor", "gaussian_coverage"],
@@ -679,7 +705,6 @@ def main(args):
             "enable_depth_loss": args.enable_depth_loss,
             "enable_sky_depth_loss": args.enable_sky_depth_loss,
             "enable_sky_opacity_loss": args.enable_sky_opacity_loss,
-            "enable_flow_reg_loss": args.enable_flow_reg_loss,
         }
 
         for name, enabled in forbidden_flags.items():

@@ -1412,6 +1412,7 @@ def update_scene(
         "gs_origins": global_origins,
         "gs_dirs": global_dirs,
         "gs_time": input_dict['gs_time'],
+        "sam_track_ids": input_dict.get("sam_track_ids"),
         
         # variable scene token state and position
         "gs_state": input_dict['gs_state'],

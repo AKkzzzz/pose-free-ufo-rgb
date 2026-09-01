@@ -30,6 +30,7 @@ from tqdm import trange
 from .constants import DATASET_DICT, DATASETS, MEAN, STD
 from .data_utils import resize_depth, resize_flow, to_float_tensor, to_tensor
 from .pose_override import PoseOverrideStore
+from .sam_tracks import load_sam_track_mask
 from ufo.paper_contract import split_context_supervision
 
 logger = logging.getLogger("UFO")
@@ -124,6 +125,8 @@ class UFODataset(Dataset):
         self.load_depth = load_depth
         self.load_flow = load_flow
         self.load_dynamic_mask = load_dynamic_mask
+        self.load_sam_tracks = getattr(args, "load_sam_tracks", False)
+        self.sam_track_root = getattr(args, "sam_track_root", "outputs/sam_tracks")
         self.load_ground_label = load_ground_label
         self.skip_sky_mask = skip_sky_mask
         self.pose_override_mode = getattr(args, "pose_override_mode", "none")
@@ -359,6 +362,7 @@ class UFODataset(Dataset):
         images, depths, sky_masks, flows = [], [], [], []
         camtoworlds, intrinsics = [], []
         dynamic_masks, ground_masks = [], []
+        sam_track_ids = []
 
         camtoworlds_global = []
 
@@ -388,7 +392,7 @@ class UFODataset(Dataset):
             world_to_canonical = np.linalg.inv(c2w_real_cur_frame)
             world_to_canonical_global = np.linalg.inv(c2w_real_global)
 
-        for camera in camera_list:
+        for camera_slot, camera in enumerate(camera_list):
             frame_camera_to_world = self._camera_to_world(
                 scene_json, camera, frame_idx, pose_role
             )
@@ -403,6 +407,18 @@ class UFODataset(Dataset):
             img = Image.open(img_path).convert("RGB")
             img = self.img_transformation(img)
             images.append(img)
+
+            if self.load_sam_tracks:
+                sam_track_ids.append(
+                    load_sam_track_mask(
+                        self.sam_track_root,
+                        scene_json["scene_name"],
+                        camera,
+                        frame_idx,
+                        self.target_size,
+                        camera_slot=camera_slot,
+                    )
+                )
 
             # Get sky mask
             if dataset_name in ["waymo", "nuscenes", "argoverse2"]:
@@ -579,6 +595,9 @@ class UFODataset(Dataset):
         frame_sky_masks = torch.stack(sky_masks) if len(sky_masks) > 0 else None
         frame_flows = torch.stack(flows) if len(flows) > 0 else None
         frame_dynamic_masks = torch.stack(dynamic_masks) if len(dynamic_masks) > 0 else None
+        frame_sam_track_ids = (
+            torch.stack(sam_track_ids) if len(sam_track_ids) > 0 else None
+        )
         frame_camtoworlds = torch.stack(camtoworlds)
         frame_camtoworlds_global = torch.stack(camtoworlds_global)
         frame_intrinsics = torch.stack(intrinsics)
@@ -595,6 +614,7 @@ class UFODataset(Dataset):
             "sky_masks": frame_sky_masks,
             "flow": frame_flows,
             "dynamic_masks": frame_dynamic_masks,
+            "sam_track_ids": frame_sam_track_ids,
             "ground_masks": ground_masks,
             "instances_corner": instances_corner_ts,
             "instances_corner_local": instances_corner_local_ts,
