@@ -263,8 +263,37 @@ def get_args_parser():
         action="store_true",
     )
     parser.add_argument(
+        "--train_sam_r5",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--sam_r5_min_track_pixels",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--sam_r5_association_max_distance",
+        type=float,
+        default=4.0,
+    )
+    parser.add_argument(
+        "--sam_r5_association_min_overlap",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--sam_r5_gs_lr_scale",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--sam_object_rgb_weight",
+        type=float,
+        default=5.0,
+    )
+    parser.add_argument(
         "--dynamic_renderer_mode",
-        choices=["bbox", "storm_velocity", "sam_rigid", "sam_object_motion"],
+        choices=["bbox", "storm_velocity", "sam_rigid", "sam_object_motion", "sam_object_canonical"],
         default="bbox",
         help="bbox: legacy UFO bbox transform; storm_velocity: Gaussian velocity * delta_t.",
     )
@@ -1017,6 +1046,69 @@ def main(args):
             trainable_names,
         )
 
+    if getattr(
+        args,
+        "train_sam_r5",
+        False,
+    ):
+
+        if (
+            getattr(
+                args,
+                "dynamic_renderer_mode",
+                None,
+            )
+            != "sam_object_canonical"
+        ):
+            raise RuntimeError(
+                "train_sam_r5 requires "
+                "dynamic_renderer_mode="
+                "sam_object_canonical"
+            )
+
+        if (
+            model.sam_object_motion_head
+            is None
+        ):
+            raise RuntimeError(
+                "R5 motion head missing"
+            )
+
+        # Freeze everything first.
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+
+        # Object dynamics.
+        for parameter in (
+            model.sam_object_motion_head
+            .parameters()
+        ):
+            parameter.requires_grad = True
+
+        # Canonical Gaussian geometry / appearance.
+        for parameter in (
+            model.gs_pred.parameters()
+        ):
+            parameter.requires_grad = True
+
+        trainable_names = [
+            name
+            for name, parameter
+            in model.named_parameters()
+            if parameter.requires_grad
+        ]
+
+        logger.info(
+            "SAM_R5_CANONICAL_TRAINING: "
+            "%d trainable tensors",
+            len(trainable_names),
+        )
+
+        logger.info(
+            "R5 trainable parameters: %s",
+            trainable_names,
+        )
+
     logger.info(f"Model = {str(model)}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"{args.model} Parameters: {n_params / 1e6:.2f}M ({n_params:,})")
@@ -1041,8 +1133,59 @@ def main(args):
     # Optimizer and loss scaler
     # ========================================================================
 
-    param_groups = optim_factory.param_groups_weight_decay(model_without_ddp, args.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    if getattr(
+        args,
+        "train_sam_r5",
+        False,
+    ):
+        param_groups = []
+
+        motion_groups = (
+            optim_factory
+            .param_groups_weight_decay(
+                model_without_ddp
+                .sam_object_motion_head,
+                args.weight_decay,
+            )
+        )
+
+        for group in motion_groups:
+            group["lr_scale"] = 1.0
+
+        gs_groups = (
+            optim_factory
+            .param_groups_weight_decay(
+                model_without_ddp.gs_pred,
+                args.weight_decay,
+            )
+        )
+
+        for group in gs_groups:
+            group["lr_scale"] = (
+                args.sam_r5_gs_lr_scale
+            )
+
+        param_groups.extend(
+            motion_groups
+        )
+        param_groups.extend(
+            gs_groups
+        )
+
+    else:
+        param_groups = (
+            optim_factory
+            .param_groups_weight_decay(
+                model_without_ddp,
+                args.weight_decay,
+            )
+        )
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=args.lr,
+        betas=(0.9, 0.95),
+    )
     loss_scaler = NativeScaler()
 
     logger.info(f"Optimizer = {optimizer}")

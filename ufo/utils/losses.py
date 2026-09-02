@@ -170,10 +170,69 @@ def compute_loss(output_dict, target_dict, args=None, lpips_loss=None):
     target_rgb = rearrange(target_dict["target_image"], "b t v c h w -> b t v h w c") * std + mean
 
     if lpips_loss is not None:
-        loss_dict = lpips_loss(pred_rgb, target_rgb)
+        loss_dict = lpips_loss(
+            pred_rgb,
+            target_rgb,
+        )
     else:
-        rgb_loss = F.mse_loss(pred_rgb, target_rgb)
-        loss_dict = {"rgb_loss": rgb_loss}
+        pixel_mse = (
+            pred_rgb - target_rgb
+        ).square().mean(dim=-1)
+
+        sam_weight = float(
+            getattr(
+                args,
+                "sam_object_rgb_weight",
+                1.0,
+            )
+        )
+
+        target_sam = target_dict.get(
+            "target_sam_track_ids"
+        )
+
+        if (
+            target_sam is not None
+            and sam_weight > 1.0
+        ):
+            object_mask = (
+                target_sam > 0
+            )
+
+            pixel_weight = torch.where(
+                object_mask,
+                torch.full_like(
+                    pixel_mse,
+                    sam_weight,
+                ),
+                torch.ones_like(
+                    pixel_mse
+                ),
+            )
+
+            rgb_loss = (
+                pixel_mse
+                * pixel_weight
+            ).sum() / (
+                pixel_weight.sum()
+                .clamp_min(1.0)
+            )
+
+            loss_dict = {
+                "rgb_loss": rgb_loss,
+                "sam_object_pixel_ratio":
+                    object_mask
+                    .float()
+                    .mean()
+                    .detach(),
+            }
+
+        else:
+            rgb_loss = pixel_mse.mean()
+
+            loss_dict = {
+                "rgb_loss": rgb_loss
+            }
 
     if args.enable_depth_loss and "target_depth" in target_dict:
         pred_depth, target_depth = pred_dict[pred_dict["depth_key"]], target_dict["target_depth"]

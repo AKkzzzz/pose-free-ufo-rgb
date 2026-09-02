@@ -292,6 +292,19 @@ def prepare_inputs_and_targets(data_dict, device=torch.device("cuda"), v=3, time
         "target_image": data_dict["target"]["image"].reshape(b, target_t, v, 3, h, w),
     }
 
+    if "sam_track_ids" in data_dict["target"]:
+        target_dict["target_sam_track_ids"] = (
+            data_dict["target"]["sam_track_ids"]
+            .reshape(
+                b,
+                target_t,
+                v,
+                h,
+                w,
+            )
+            .long()
+        )
+
     if "depth" in data_dict["target"]:
         target_dict["target_depth"] = data_dict["target"]["depth"].reshape(
             b, target_t, v, depth_h, depth_w

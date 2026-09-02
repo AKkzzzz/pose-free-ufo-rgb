@@ -658,21 +658,43 @@ class UFO(ViT):
         self.enable_mem_gs = False
         self.args = args
 
-        # R4: RGB-derived SAM object-level motion.
+        # R4/R5 object-level motion.
         self.sam_object_motion_head = None
 
-        if getattr(
+        dynamic_mode_init = getattr(
             args,
             "dynamic_renderer_mode",
             "bbox",
-        ) == "sam_object_motion":
+        )
+
+        if dynamic_mode_init == "sam_object_motion":
 
             from ufo.models.sam_object_motion import (
                 SAMObjectMotionHead,
             )
 
+            self.sam_object_motion_head = SAMObjectMotionHead(
+                embed_dim=embed_dim,
+                hidden_dim=getattr(
+                    args,
+                    "sam_motion_hidden_dim",
+                    384,
+                ),
+                max_speed=getattr(
+                    args,
+                    "sam_motion_max_speed",
+                    20.0,
+                ),
+            )
+
+        elif dynamic_mode_init == "sam_object_canonical":
+
+            from ufo.models.sam_object_motion_r5 import (
+                SAMCanonicalObjectMotionHead,
+            )
+
             self.sam_object_motion_head = (
-                SAMObjectMotionHead(
+                SAMCanonicalObjectMotionHead(
                     embed_dim=embed_dim,
                     hidden_dim=getattr(
                         args,
@@ -1467,6 +1489,69 @@ class UFO(ViT):
         renderer_mode = getattr(self.args, "dynamic_renderer_mode", "bbox")
         sam_track_ids_dense = None
 
+        if renderer_mode == "sam_object_canonical":
+
+            global_track_ids = gs_params.get(
+                "r5_global_track_ids"
+            )
+
+            canonical_keep = gs_params.get(
+                "r5_canonical_keep"
+            )
+
+            if (
+                global_track_ids is None
+                or canonical_keep is None
+            ):
+                raise RuntimeError(
+                    "R5 renderer requires "
+                    "global_track_ids + canonical_keep"
+                )
+
+            sam_track_ids_dense = (
+                global_track_ids
+            )
+
+            global_flat = rearrange(
+                global_track_ids,
+                "b t v h w -> b (t v h w)",
+            )
+
+            canonical_flat = rearrange(
+                canonical_keep,
+                "b t v h w -> b (t v h w)",
+            )
+
+            dynamic_flat = (
+                global_flat > 0
+            )
+
+            # Static/background: always active.
+            # Dynamic: ONLY canonical source is active.
+            active_flat = (
+                (~dynamic_flat)
+                | canonical_flat
+            )
+
+            opacities = (
+                opacities
+                * active_flat.to(
+                    opacities.dtype
+                )
+            )
+
+            data_dict[
+                "r5_active_dynamic_ratio"
+            ] = (
+                (
+                    dynamic_flat
+                    & canonical_flat
+                )
+                .float()
+                .mean()
+            )
+
+
         if renderer_mode == "sam_rigid":
             from ufo.models.sam_rigid_motion import rigidify_learned_velocity
 
@@ -2061,7 +2146,7 @@ class UFO(ViT):
             # --------------------------------------------------
             if (
                 renderer_mode
-                == "sam_object_motion"
+                in ("sam_object_motion", "sam_object_canonical")
                 and sam_track_ids_dense
                 is not None
             ):
@@ -2439,7 +2524,84 @@ class UFO(ViT):
 
         dynamic_mode = getattr(self.args, "dynamic_renderer_mode", "bbox")
 
-        if dynamic_mode == "sam_object_motion":
+        if dynamic_mode == "sam_object_canonical":
+
+            from ufo.models.sam_object_motion_r5 import (
+                predict_sam_canonical_motion,
+            )
+
+            if self.sam_object_motion_head is None:
+                raise RuntimeError(
+                    "R5 canonical motion head "
+                    "was not initialized"
+                )
+
+            (
+                forward_flow,
+                global_track_ids,
+                canonical_keep,
+                r5_diag,
+            ) = predict_sam_canonical_motion(
+                gs_state=x,
+                means=gs_params["means"],
+                local_track_ids=data_dict.get(
+                    "sam_track_ids"
+                ),
+                gs_time=data_dict["gs_time"],
+                timespan=data_dict["timespan"],
+                motion_head=self.sam_object_motion_head,
+                patch_size=self.unpatch_size,
+                min_observations=getattr(
+                    self.args,
+                    "sam_motion_min_observations",
+                    2,
+                ),
+                min_track_pixels=getattr(
+                    self.args,
+                    "sam_r5_min_track_pixels",
+                    16,
+                ),
+                association_max_distance=getattr(
+                    self.args,
+                    "sam_r5_association_max_distance",
+                    4.0,
+                ),
+                association_min_overlap=getattr(
+                    self.args,
+                    "sam_r5_association_min_overlap",
+                    1,
+                ),
+            )
+
+            gs_params["forward_flow"] = forward_flow
+            gs_params["r5_global_track_ids"] = (
+                global_track_ids
+            )
+            gs_params["r5_canonical_keep"] = (
+                canonical_keep
+            )
+
+            for key, value in r5_diag.items():
+
+                if torch.is_tensor(value):
+                    data_dict[key] = value
+                else:
+                    data_dict[key] = torch.tensor(
+                        float(value),
+                        device=x.device,
+                    )
+
+            # Renderer still expects legacy bbox tensors.
+            # They remain background-only in pose-free mode.
+            if "bbox_weights" not in data_dict:
+                data_dict = (
+                    self.forward_motion_predictor_bbox(
+                        data_dict,
+                        gs_params,
+                    )
+                )
+
+        elif dynamic_mode == "sam_object_motion":
 
             from ufo.models.sam_object_motion import (
                 predict_sam_object_velocity,
