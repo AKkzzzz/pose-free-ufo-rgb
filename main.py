@@ -292,8 +292,27 @@ def get_args_parser():
         default=5.0,
     )
     parser.add_argument(
+        "--sam_r6_voxel_size",
+        type=float,
+        default=0.12,
+    )
+    parser.add_argument(
+        "--sam_r6_min_voxel_support",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--train_sam_r6_fusion_only",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--sam_object_edge_weight",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
         "--dynamic_renderer_mode",
-        choices=["bbox", "storm_velocity", "sam_rigid", "sam_object_motion", "sam_object_canonical"],
+        choices=["bbox", "storm_velocity", "sam_rigid", "sam_object_motion", "sam_object_canonical", "sam_object_fusion"],
         default="bbox",
         help="bbox: legacy UFO bbox transform; storm_velocity: Gaussian velocity * delta_t.",
     )
@@ -1109,6 +1128,73 @@ def main(args):
             trainable_names,
         )
 
+    if getattr(
+        args,
+        "train_sam_r6_fusion_only",
+        False,
+    ):
+
+        if (
+            getattr(
+                args,
+                "dynamic_renderer_mode",
+                None,
+            )
+            != "sam_object_fusion"
+        ):
+            raise RuntimeError(
+                "train_sam_r6_fusion_only "
+                "requires "
+                "dynamic_renderer_mode="
+                "sam_object_fusion"
+            )
+
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+
+        # Object-level motion.
+        for parameter in (
+            model.sam_object_motion_head
+            .parameters()
+        ):
+            parameter.requires_grad = True
+
+        # Gaussian geometry + appearance.
+        for parameter in (
+            model.gs_pred.parameters()
+        ):
+            parameter.requires_grad = True
+
+        # Camera color calibration remains useful
+        # for fused multi-view appearance.
+        if getattr(
+            model,
+            "affine_linear",
+            None,
+        ) is not None:
+            for parameter in (
+                model.affine_linear.parameters()
+            ):
+                parameter.requires_grad = True
+
+        trainable_names = [
+            name
+            for name, parameter
+            in model.named_parameters()
+            if parameter.requires_grad
+        ]
+
+        logger.info(
+            "SAM_R6_FUSION_ONLY: "
+            "%d trainable tensors",
+            len(trainable_names),
+        )
+
+        logger.info(
+            "R6 trainable parameters: %s",
+            trainable_names,
+        )
+
     logger.info(f"Model = {str(model)}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"{args.model} Parameters: {n_params / 1e6:.2f}M ({n_params:,})")
@@ -1540,14 +1626,71 @@ def main(args):
 
             if final_scene_supervision:
                 if args.sequential_chunk_backward:
-                    raise ValueError("final_scene supervision requires one backward after all renders")
-                for (render_source, target_dict), update_output in zip(
-                    final_scene_inputs, final_scene_update_outputs
+                    raise ValueError(
+                        "final_scene supervision requires "
+                        "one backward after all renders"
+                    )
+
+                r6_cached_stage2 = None
+
+                if (
+                    args.dynamic_renderer_mode
+                    == "sam_object_fusion"
                 ):
-                    render_input = render_source.copy()
-                    render_input.update(all_gs_features)
-                    render_input = model(render_input, stage=2, motion=False)
-                    pred_dict = model(render_input, stage=3)
+                    r6_stage2_input = (
+                        final_scene_inputs[
+                            0
+                        ][0].copy()
+                    )
+
+                    r6_stage2_input.update(
+                        all_gs_features
+                    )
+
+                    r6_cached_stage2 = model(
+                        r6_stage2_input,
+                        stage=2,
+                        motion=False,
+                    )
+
+                for (
+                    render_source,
+                    target_dict,
+                ), update_output in zip(
+                    final_scene_inputs,
+                    final_scene_update_outputs,
+                ):
+
+                    render_input = (
+                        render_source.copy()
+                    )
+
+                    render_input.update(
+                        all_gs_features
+                    )
+
+                    if (
+                        r6_cached_stage2
+                        is not None
+                    ):
+                        render_input[
+                            "gs_params"
+                        ] = (
+                            r6_cached_stage2[
+                                "gs_params"
+                            ]
+                        )
+                    else:
+                        render_input = model(
+                            render_input,
+                            stage=2,
+                            motion=False,
+                        )
+
+                    pred_dict = model(
+                        render_input,
+                        stage=3,
+                    )
                     loss_dict = compute_loss(pred_dict, target_dict, args, rgb_and_lpips_loss)
                     if 'class_loss' in update_output:
                         loss_dict['class_loss'] = update_output['class_loss']

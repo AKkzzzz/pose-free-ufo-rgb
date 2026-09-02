@@ -1343,7 +1343,30 @@ def update_scene(
     if profile:
         torch.cuda.synchronize()
         start_time = time.perf_counter()
-    input_dict = model(input_dict, stage=2, motion=True)
+    r6_scene_update_only = (
+        getattr(
+            model_args,
+            "dynamic_renderer_mode",
+            "bbox",
+        )
+        == "sam_object_fusion"
+    )
+
+    if r6_scene_update_only:
+        input_dict[
+            "_r6_scene_update_only"
+        ] = True
+
+    input_dict = model(
+        input_dict,
+        stage=2,
+        motion=True,
+    )
+
+    input_dict.pop(
+        "_r6_scene_update_only",
+        None,
+    )
     if profile:
         torch.cuda.synchronize()
         end_time = time.perf_counter()
@@ -1429,8 +1452,8 @@ def update_scene(
         
         
         # keep record of bbox metadata (constant)
-        "bbox_weights": input_dict['bbox_weights'],
-        "bbox_token_weights": input_dict['bbox_token_weights'],
+        "bbox_weights": input_dict.get('bbox_weights'),
+        "bbox_token_weights": input_dict.get('bbox_token_weights'),
         "bbox_token_logits": input_dict.get('bbox_token_logits'),
         "context_instances_corner": input_dict['context_instances_corner'],
         "context_instances_id": input_dict['context_instances_id'],

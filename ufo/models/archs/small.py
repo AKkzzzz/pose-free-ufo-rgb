@@ -687,7 +687,10 @@ class UFO(ViT):
                 ),
             )
 
-        elif dynamic_mode_init == "sam_object_canonical":
+        elif dynamic_mode_init in (
+            "sam_object_canonical",
+            "sam_object_fusion",
+        ):
 
             from ufo.models.sam_object_motion_r5 import (
                 SAMCanonicalObjectMotionHead,
@@ -1489,7 +1492,27 @@ class UFO(ViT):
         renderer_mode = getattr(self.args, "dynamic_renderer_mode", "bbox")
         sam_track_ids_dense = None
 
-        if renderer_mode == "sam_object_canonical":
+        if renderer_mode == "sam_object_fusion":
+
+            global_track_ids = (
+                gs_params.get(
+                    "r6_global_track_ids"
+                )
+            )
+
+            if global_track_ids is None:
+                raise RuntimeError(
+                    "R6 renderer requires "
+                    "r6_global_track_ids"
+                )
+
+            # Fused opacities already select the
+            # canonical Gaussian representatives.
+            sam_track_ids_dense = (
+                global_track_ids
+            )
+
+        elif renderer_mode == "sam_object_canonical":
 
             global_track_ids = gs_params.get(
                 "r5_global_track_ids"
@@ -1759,282 +1782,292 @@ class UFO(ViT):
         lifespan = rearrange(gs_params['lifespan'], "b t v h w c -> b (t v h w) c")
         ### transform gaussian means
 
-        probabilities = rearrange(data_dict['bbox_weights'], "b t v h w k -> b t (v h w) k")
-        token_probabilities = rearrange(
-            data_dict['bbox_token_weights'], "b (t n) k -> b t n k", t=t
-        )
-        token_logits = rearrange(
-            data_dict['bbox_token_logits'], "b (t n) k -> b t n k", t=t
-        )
-        t_means = rearrange(gs_params["means"], "b t v h w c -> b t (v h w) c")
-        token_means = rearrange(data_dict['gs_token_means'], "b (t n) c -> b t n c", t=t)
-        assignment_means = token_means
-        assignment_valid = None
-        if self.args.object_assignment_gt_mode == "lidar_anchor":
-            assignment_means = rearrange(
-                data_dict['assignment_anchor_means'], "b (t n) c -> b t n c", t=t
-            )
-            assignment_valid = rearrange(
-                data_dict['assignment_anchor_valid'], "b (t n) -> b t n", t=t
-            )
+        if renderer_mode == "sam_object_fusion":
+            # R6 motion is fully controlled by
+            # global SAM object IDs + canonical fusion.
+            # Do not allocate or evaluate the legacy
+            # N_gaussian x N_bbox assignment tensors.
+            probabilities = None
+            transformed_means = None
+            transformed_quats = None
 
-
-        with torch.no_grad():
-            gt_prob = torch.zeros_like(token_probabilities)
-            gaussian_dynamic_ratios = []
-            gaussian_gt_labels = []
-            coverage_maxima = []
-            for _t in range(t):
-                if self.args.object_assignment_gt_mode == "gaussian_coverage":
-                    gaussian_prob = points_in_boxes_probability(
-                        t_means[:, _t].detach(),
-                        data_dict['context_instances_corner'][:, _t],
-                        data_dict['context_instances_id'][:, _t],
-                        temperature=0.01,
-                    )
-                    gaussian_labels = gaussian_prob.argmax(dim=-1)
-                    gaussian_gt_labels.append(gaussian_labels)
-                    token_labels, max_coverage = gaussian_labels_to_token_labels(
-                        gaussian_labels,
-                        views=v,
-                        height=h,
-                        width=w,
-                        patch_size=self.unpatch_size,
-                        num_classes=1 + self.num_bbox,
-                        threshold=self.args.object_gaussian_coverage_threshold,
-                    )
-                    gt_prob[:, _t] = F.one_hot(
-                        token_labels, num_classes=1 + self.num_bbox
-                    ).to(gt_prob.dtype)
-                    gaussian_dynamic_ratios.append(
-                        (gaussian_labels > 0).float().mean()
-                    )
-                    coverage_maxima.append(max_coverage)
-                else:
-                    gt_prob[:, _t] = points_in_boxes_probability(
-                        assignment_means[:, _t].detach(),
-                        data_dict['context_instances_corner'][:, _t],
-                        data_dict['context_instances_id'][:, _t],
-                        temperature=0.01,
-                    )
-            if gaussian_dynamic_ratios:
-                data_dict['object_gaussian_dynamic_gt_ratio'] = torch.stack(
-                    gaussian_dynamic_ratios
-                ).mean()
-                data_dict['object_gaussian_coverage_max_mean'] = torch.cat(
-                    coverage_maxima, dim=1
-                ).mean()
-                gaussian_gt_labels = torch.stack(gaussian_gt_labels, dim=1)
-                gaussian_predictions = probabilities.argmax(dim=-1)
-                gaussian_dynamic_gt = gaussian_gt_labels > 0
-                gaussian_predicted_dynamic = gaussian_predictions > 0
-                data_dict['object_gaussian_predicted_dynamic_ratio'] = (
-                    gaussian_predicted_dynamic.float().mean()
-                )
-                if gaussian_dynamic_gt.any():
-                    data_dict['object_gaussian_foreground_recall'] = (
-                        gaussian_predictions[gaussian_dynamic_gt] > 0
-                    ).float().mean()
-                    data_dict['object_gaussian_dynamic_assignment_accuracy'] = (
-                        gaussian_predictions[gaussian_dynamic_gt]
-                        == gaussian_gt_labels[gaussian_dynamic_gt]
-                    ).float().mean()
-                if gaussian_predicted_dynamic.any():
-                    data_dict['object_gaussian_foreground_precision'] = (
-                        gaussian_gt_labels[gaussian_predicted_dynamic] > 0
-                    ).float().mean()
-
-            if getattr(self.args, "renderer_assignment_coordinate_diagnostics", False):
-                data_dict['renderer_coordinate_diagnostics_enabled'] = torch.ones(
-                    (), device=assignment_means.device
-                )
-                local_corners = data_dict.get('context_instances_corner_local')
-                if local_corners is not None:
-                    # input_dict retains only the current chunk's local boxes,
-                    # while scene-backed tensors contain all accumulated chunks.
-                    sample_t = min(t, local_corners.shape[1])
-                    sample_means = assignment_means[:, -sample_t:].detach().float()
-                    global_corners = data_dict['context_instances_corner'][:, -sample_t:].float()
-                    global_valid = data_dict['context_instances_id'][:, -sample_t:]
-                    local_corners = local_corners[:, -sample_t:].float()
-                    global_labels = []
-                    local_labels = []
-                    global_distances = []
-                    local_distances = []
-                    for diagnostic_t in range(sample_t):
-                        points = sample_means[:, diagnostic_t]
-                        valid = global_valid[:, diagnostic_t]
-                        global_labels.append(points_in_boxes_probability(
-                            points, global_corners[:, diagnostic_t], valid,
-                            temperature=0.01,
-                        ).argmax(dim=-1))
-                        local_labels.append(points_in_boxes_probability(
-                            points, local_corners[:, diagnostic_t], valid,
-                            temperature=0.01,
-                        ).argmax(dim=-1))
-                        global_distances.append(points_to_oriented_boxes_distance(
-                            points, global_corners[:, diagnostic_t], valid,
-                        ))
-                        local_distances.append(points_to_oriented_boxes_distance(
-                            points, local_corners[:, diagnostic_t], valid,
-                        ))
-                    global_labels = torch.stack(global_labels, dim=1)
-                    local_labels = torch.stack(local_labels, dim=1)
-                    global_distances = torch.stack(global_distances, dim=1)
-                    local_distances = torch.stack(local_distances, dim=1)
-                    gaussian_labels = []
-                    for diagnostic_t in range(sample_t):
-                        gaussian_labels.append(points_in_boxes_probability(
-                            t_means[:, -sample_t + diagnostic_t].detach().float(),
-                            global_corners[:, diagnostic_t],
-                            global_valid[:, diagnostic_t],
-                            temperature=0.01,
-                        ).argmax(dim=-1))
-                    gaussian_labels = torch.stack(gaussian_labels, dim=1)
-                    corner_center_delta = (
-                        global_corners.mean(dim=-2) - local_corners.mean(dim=-2)
-                    ).norm(dim=-1)
-                    data_dict['renderer_diag_token_count'] = torch.tensor(
-                        global_labels.numel(), device=global_labels.device
-                    )
-                    data_dict['renderer_global_dynamic_gt_count'] = (
-                        global_labels > 0
-                    ).sum()
-                    data_dict['renderer_local_dynamic_gt_count'] = (
-                        local_labels > 0
-                    ).sum()
-                    data_dict['renderer_global_gaussian_dynamic_gt_count'] = (
-                        gaussian_labels > 0
-                    ).sum()
-                    data_dict['renderer_global_gaussian_dynamic_gt_ratio'] = (
-                        gaussian_labels > 0
-                    ).float().mean()
-                    data_dict['renderer_global_nearest_bbox_distance_mean'] = (
-                        global_distances[torch.isfinite(global_distances)].mean()
-                    )
-                    data_dict['renderer_local_nearest_bbox_distance_mean'] = (
-                        local_distances[torch.isfinite(local_distances)].mean()
-                    )
-                    data_dict['renderer_global_nearest_bbox_distance_min'] = (
-                        global_distances.amin()
-                    )
-                    data_dict['renderer_local_nearest_bbox_distance_min'] = (
-                        local_distances.amin()
-                    )
-                    data_dict['renderer_global_local_bbox_center_delta_mean'] = (
-                        corner_center_delta[global_valid.bool()].mean()
-                    )
-                    data_dict['renderer_global_local_bbox_center_delta_max'] = (
-                        corner_center_delta[global_valid.bool()].max()
-                    )
-
-        gt_soft_prob = gt_prob
-        gt_prob = gt_soft_prob.argmax(dim=-1)
-        loss_mask = (
-            assignment_valid.bool()
-            if assignment_valid is not None
-            else torch.ones_like(gt_prob, dtype=torch.bool)
-        )
-        loss_gt_prob = gt_prob[loss_mask]
-        loss_pred_porb = token_probabilities[loss_mask]
-        loss_pred_logits = token_logits[loss_mask]
-        log_probs = F.log_softmax(loss_pred_logits, dim=-1)
-
-        if loss_gt_prob.numel() == 0:
-            loss = token_probabilities.sum() * 0.0
         else:
-            class_weight = torch.ones(
-                token_probabilities.shape[-1], device=log_probs.device, dtype=log_probs.dtype
+            probabilities = rearrange(data_dict['bbox_weights'], "b t v h w k -> b t (v h w) k")
+            token_probabilities = rearrange(
+                data_dict['bbox_token_weights'], "b (t n) k -> b t n k", t=t
             )
-            class_weight[0] = self.args.object_assignment_background_weight
-            loss = F.cross_entropy(loss_pred_logits, loss_gt_prob, weight=class_weight)
-        data_dict['class_loss'] = loss * self.args.object_assignment_loss_coeff
-        data_dict['object_supervised_token_ratio'] = loss_mask.float().mean()
-        if loss_gt_prob.numel():
-            data_dict['object_assignment_accuracy'] = (
-                loss_pred_porb.argmax(dim=-1) == loss_gt_prob
-            ).float().mean()
-        dynamic_gt_mask = loss_gt_prob > 0
-        data_dict['object_dynamic_gt_ratio'] = dynamic_gt_mask.float().mean()
-        data_dict['object_dynamic_gt_count'] = dynamic_gt_mask.sum()
-        if dynamic_gt_mask.any():
-            dynamic_predictions = loss_pred_porb[dynamic_gt_mask].argmax(dim=-1)
-            data_dict['object_dynamic_assignment_accuracy'] = (
-                dynamic_predictions == loss_gt_prob[dynamic_gt_mask]
-            ).float().mean()
-            data_dict['object_dynamic_background_error_ratio'] = (
-                dynamic_predictions == 0
-            ).float().mean()
-            data_dict['object_foreground_recall'] = (
-                dynamic_predictions > 0
-            ).float().mean()
-        predicted_foreground = loss_pred_porb.argmax(dim=-1) > 0
-        if loss_pred_porb.numel():
-            data_dict['object_predicted_dynamic_ratio'] = predicted_foreground.float().mean()
-            data_dict['object_background_probability'] = loss_pred_porb[..., 0].mean()
-            data_dict['object_assignment_entropy'] = -(
-                loss_pred_porb * torch.log(loss_pred_porb.clamp_min(1e-8))
-            ).sum(dim=-1).mean()
-        if predicted_foreground.any():
-            data_dict['object_foreground_precision'] = (
-                loss_gt_prob[predicted_foreground] > 0
-            ).float().mean()
-        background_gt = loss_gt_prob == 0
-        if background_gt.any():
-            data_dict['object_background_precision'] = (
-                loss_pred_porb[background_gt].argmax(dim=-1) == 0
-            ).float().mean()
-
-        dummy_context_instance_pose = torch.eye(4).reshape(1, 1, 1, 4, 4).repeat(b, t, 1, 1, 1).to(probabilities)
-        dummy_target_instance_pose = torch.eye(4).reshape(1, 1, 1, 4, 4).repeat(b, tgt_t, 1, 1, 1).to(probabilities)
-
-        ### bbox not related to time
-        context_instance_poses = torch.cat([dummy_context_instance_pose, data_dict['context_instances_pose']], dim=2)
-        target_instance_poses = torch.cat([dummy_target_instance_pose, data_dict['target_instances_pose']], dim=2)
-        valid_pose = (
-            data_dict['context_instances_id'][:, :, None].bool()
-            & data_dict['target_instances_id'][:, None].bool()
-        )
-        data_dict['bbox_valid_count'] = data_dict['context_instances_id'].sum()
-        if valid_pose.any():
-            context_pose = data_dict['context_instances_pose'][:, :, None]
-            target_pose = data_dict['target_instances_pose'][:, None]
-            pose_translation = (
-                target_pose[..., :3, 3] - context_pose[..., :3, 3]
-            ).norm(dim=-1)[valid_pose]
-            relative_rotation = (
-                target_pose[..., :3, :3]
-                @ context_pose[..., :3, :3].transpose(-2, -1)
+            token_logits = rearrange(
+                data_dict['bbox_token_logits'], "b (t n) k -> b t n k", t=t
             )
-            pose_yaw = torch.rad2deg(torch.atan2(
-                relative_rotation[..., 1, 0], relative_rotation[..., 0, 0]
-            ).abs())[valid_pose]
-            data_dict['bbox_pose_mean_translation'] = pose_translation.mean()
-            data_dict['bbox_pose_max_translation'] = pose_translation.max()
-            data_dict['bbox_pose_mean_rotation_deg'] = pose_yaw.mean()
-            data_dict['bbox_pose_max_rotation_deg'] = pose_yaw.max()
-        transformed_means = transform_gaussian_means_with_instances(
-            context_instance_poses,  # [B, T_context, N_box, 4, 4]
-            target_instance_poses,   # [B, T_target, N_box, 4, 4]
-            t_means,                   # [B, T_context, N_gs, 3]
-            probabilities,          # [B, T_context, N_gs, N_box]
-            stable_delta=getattr(self.args, "stable_bbox_delta_transform", False),
-        )
-        data_dict['bbox_motion_mean_displacement'] = (
-            transformed_means - t_means[:, None]
-        ).norm(dim=-1).mean()
-        data_dict['bbox_motion_max_displacement'] = (
-            transformed_means - t_means[:, None]
-        ).norm(dim=-1).max()
+            t_means = rearrange(gs_params["means"], "b t v h w c -> b t (v h w) c")
+            token_means = rearrange(data_dict['gs_token_means'], "b (t n) c -> b t n c", t=t)
+            assignment_means = token_means
+            assignment_valid = None
+            if self.args.object_assignment_gt_mode == "lidar_anchor":
+                assignment_means = rearrange(
+                    data_dict['assignment_anchor_means'], "b (t n) c -> b t n c", t=t
+                )
+                assignment_valid = rearrange(
+                    data_dict['assignment_anchor_valid'], "b (t n) -> b t n", t=t
+                )
 
-        transformed_means = rearrange(transformed_means, "b t v n c -> (b t) (v n) c")
-        transformed_quats = None
-        if self.args.paper_bbox_rotation:
-            t_quats = rearrange(gs_params["quats"], "b t v h w c -> b t (v h w) c")
-            transformed_quats = transform_gaussian_quats_with_instances(
-                context_instance_poses, target_instance_poses, t_quats, probabilities
+
+            with torch.no_grad():
+                gt_prob = torch.zeros_like(token_probabilities)
+                gaussian_dynamic_ratios = []
+                gaussian_gt_labels = []
+                coverage_maxima = []
+                for _t in range(t):
+                    if self.args.object_assignment_gt_mode == "gaussian_coverage":
+                        gaussian_prob = points_in_boxes_probability(
+                            t_means[:, _t].detach(),
+                            data_dict['context_instances_corner'][:, _t],
+                            data_dict['context_instances_id'][:, _t],
+                            temperature=0.01,
+                        )
+                        gaussian_labels = gaussian_prob.argmax(dim=-1)
+                        gaussian_gt_labels.append(gaussian_labels)
+                        token_labels, max_coverage = gaussian_labels_to_token_labels(
+                            gaussian_labels,
+                            views=v,
+                            height=h,
+                            width=w,
+                            patch_size=self.unpatch_size,
+                            num_classes=1 + self.num_bbox,
+                            threshold=self.args.object_gaussian_coverage_threshold,
+                        )
+                        gt_prob[:, _t] = F.one_hot(
+                            token_labels, num_classes=1 + self.num_bbox
+                        ).to(gt_prob.dtype)
+                        gaussian_dynamic_ratios.append(
+                            (gaussian_labels > 0).float().mean()
+                        )
+                        coverage_maxima.append(max_coverage)
+                    else:
+                        gt_prob[:, _t] = points_in_boxes_probability(
+                            assignment_means[:, _t].detach(),
+                            data_dict['context_instances_corner'][:, _t],
+                            data_dict['context_instances_id'][:, _t],
+                            temperature=0.01,
+                        )
+                if gaussian_dynamic_ratios:
+                    data_dict['object_gaussian_dynamic_gt_ratio'] = torch.stack(
+                        gaussian_dynamic_ratios
+                    ).mean()
+                    data_dict['object_gaussian_coverage_max_mean'] = torch.cat(
+                        coverage_maxima, dim=1
+                    ).mean()
+                    gaussian_gt_labels = torch.stack(gaussian_gt_labels, dim=1)
+                    gaussian_predictions = probabilities.argmax(dim=-1)
+                    gaussian_dynamic_gt = gaussian_gt_labels > 0
+                    gaussian_predicted_dynamic = gaussian_predictions > 0
+                    data_dict['object_gaussian_predicted_dynamic_ratio'] = (
+                        gaussian_predicted_dynamic.float().mean()
+                    )
+                    if gaussian_dynamic_gt.any():
+                        data_dict['object_gaussian_foreground_recall'] = (
+                            gaussian_predictions[gaussian_dynamic_gt] > 0
+                        ).float().mean()
+                        data_dict['object_gaussian_dynamic_assignment_accuracy'] = (
+                            gaussian_predictions[gaussian_dynamic_gt]
+                            == gaussian_gt_labels[gaussian_dynamic_gt]
+                        ).float().mean()
+                    if gaussian_predicted_dynamic.any():
+                        data_dict['object_gaussian_foreground_precision'] = (
+                            gaussian_gt_labels[gaussian_predicted_dynamic] > 0
+                        ).float().mean()
+
+                if getattr(self.args, "renderer_assignment_coordinate_diagnostics", False):
+                    data_dict['renderer_coordinate_diagnostics_enabled'] = torch.ones(
+                        (), device=assignment_means.device
+                    )
+                    local_corners = data_dict.get('context_instances_corner_local')
+                    if local_corners is not None:
+                        # input_dict retains only the current chunk's local boxes,
+                        # while scene-backed tensors contain all accumulated chunks.
+                        sample_t = min(t, local_corners.shape[1])
+                        sample_means = assignment_means[:, -sample_t:].detach().float()
+                        global_corners = data_dict['context_instances_corner'][:, -sample_t:].float()
+                        global_valid = data_dict['context_instances_id'][:, -sample_t:]
+                        local_corners = local_corners[:, -sample_t:].float()
+                        global_labels = []
+                        local_labels = []
+                        global_distances = []
+                        local_distances = []
+                        for diagnostic_t in range(sample_t):
+                            points = sample_means[:, diagnostic_t]
+                            valid = global_valid[:, diagnostic_t]
+                            global_labels.append(points_in_boxes_probability(
+                                points, global_corners[:, diagnostic_t], valid,
+                                temperature=0.01,
+                            ).argmax(dim=-1))
+                            local_labels.append(points_in_boxes_probability(
+                                points, local_corners[:, diagnostic_t], valid,
+                                temperature=0.01,
+                            ).argmax(dim=-1))
+                            global_distances.append(points_to_oriented_boxes_distance(
+                                points, global_corners[:, diagnostic_t], valid,
+                            ))
+                            local_distances.append(points_to_oriented_boxes_distance(
+                                points, local_corners[:, diagnostic_t], valid,
+                            ))
+                        global_labels = torch.stack(global_labels, dim=1)
+                        local_labels = torch.stack(local_labels, dim=1)
+                        global_distances = torch.stack(global_distances, dim=1)
+                        local_distances = torch.stack(local_distances, dim=1)
+                        gaussian_labels = []
+                        for diagnostic_t in range(sample_t):
+                            gaussian_labels.append(points_in_boxes_probability(
+                                t_means[:, -sample_t + diagnostic_t].detach().float(),
+                                global_corners[:, diagnostic_t],
+                                global_valid[:, diagnostic_t],
+                                temperature=0.01,
+                            ).argmax(dim=-1))
+                        gaussian_labels = torch.stack(gaussian_labels, dim=1)
+                        corner_center_delta = (
+                            global_corners.mean(dim=-2) - local_corners.mean(dim=-2)
+                        ).norm(dim=-1)
+                        data_dict['renderer_diag_token_count'] = torch.tensor(
+                            global_labels.numel(), device=global_labels.device
+                        )
+                        data_dict['renderer_global_dynamic_gt_count'] = (
+                            global_labels > 0
+                        ).sum()
+                        data_dict['renderer_local_dynamic_gt_count'] = (
+                            local_labels > 0
+                        ).sum()
+                        data_dict['renderer_global_gaussian_dynamic_gt_count'] = (
+                            gaussian_labels > 0
+                        ).sum()
+                        data_dict['renderer_global_gaussian_dynamic_gt_ratio'] = (
+                            gaussian_labels > 0
+                        ).float().mean()
+                        data_dict['renderer_global_nearest_bbox_distance_mean'] = (
+                            global_distances[torch.isfinite(global_distances)].mean()
+                        )
+                        data_dict['renderer_local_nearest_bbox_distance_mean'] = (
+                            local_distances[torch.isfinite(local_distances)].mean()
+                        )
+                        data_dict['renderer_global_nearest_bbox_distance_min'] = (
+                            global_distances.amin()
+                        )
+                        data_dict['renderer_local_nearest_bbox_distance_min'] = (
+                            local_distances.amin()
+                        )
+                        data_dict['renderer_global_local_bbox_center_delta_mean'] = (
+                            corner_center_delta[global_valid.bool()].mean()
+                        )
+                        data_dict['renderer_global_local_bbox_center_delta_max'] = (
+                            corner_center_delta[global_valid.bool()].max()
+                        )
+
+            gt_soft_prob = gt_prob
+            gt_prob = gt_soft_prob.argmax(dim=-1)
+            loss_mask = (
+                assignment_valid.bool()
+                if assignment_valid is not None
+                else torch.ones_like(gt_prob, dtype=torch.bool)
             )
-            transformed_quats = rearrange(transformed_quats, "b t v n c -> (b t) (v n) c")
+            loss_gt_prob = gt_prob[loss_mask]
+            loss_pred_porb = token_probabilities[loss_mask]
+            loss_pred_logits = token_logits[loss_mask]
+            log_probs = F.log_softmax(loss_pred_logits, dim=-1)
+
+            if loss_gt_prob.numel() == 0:
+                loss = token_probabilities.sum() * 0.0
+            else:
+                class_weight = torch.ones(
+                    token_probabilities.shape[-1], device=log_probs.device, dtype=log_probs.dtype
+                )
+                class_weight[0] = self.args.object_assignment_background_weight
+                loss = F.cross_entropy(loss_pred_logits, loss_gt_prob, weight=class_weight)
+            data_dict['class_loss'] = loss * self.args.object_assignment_loss_coeff
+            data_dict['object_supervised_token_ratio'] = loss_mask.float().mean()
+            if loss_gt_prob.numel():
+                data_dict['object_assignment_accuracy'] = (
+                    loss_pred_porb.argmax(dim=-1) == loss_gt_prob
+                ).float().mean()
+            dynamic_gt_mask = loss_gt_prob > 0
+            data_dict['object_dynamic_gt_ratio'] = dynamic_gt_mask.float().mean()
+            data_dict['object_dynamic_gt_count'] = dynamic_gt_mask.sum()
+            if dynamic_gt_mask.any():
+                dynamic_predictions = loss_pred_porb[dynamic_gt_mask].argmax(dim=-1)
+                data_dict['object_dynamic_assignment_accuracy'] = (
+                    dynamic_predictions == loss_gt_prob[dynamic_gt_mask]
+                ).float().mean()
+                data_dict['object_dynamic_background_error_ratio'] = (
+                    dynamic_predictions == 0
+                ).float().mean()
+                data_dict['object_foreground_recall'] = (
+                    dynamic_predictions > 0
+                ).float().mean()
+            predicted_foreground = loss_pred_porb.argmax(dim=-1) > 0
+            if loss_pred_porb.numel():
+                data_dict['object_predicted_dynamic_ratio'] = predicted_foreground.float().mean()
+                data_dict['object_background_probability'] = loss_pred_porb[..., 0].mean()
+                data_dict['object_assignment_entropy'] = -(
+                    loss_pred_porb * torch.log(loss_pred_porb.clamp_min(1e-8))
+                ).sum(dim=-1).mean()
+            if predicted_foreground.any():
+                data_dict['object_foreground_precision'] = (
+                    loss_gt_prob[predicted_foreground] > 0
+                ).float().mean()
+            background_gt = loss_gt_prob == 0
+            if background_gt.any():
+                data_dict['object_background_precision'] = (
+                    loss_pred_porb[background_gt].argmax(dim=-1) == 0
+                ).float().mean()
+
+            dummy_context_instance_pose = torch.eye(4).reshape(1, 1, 1, 4, 4).repeat(b, t, 1, 1, 1).to(probabilities)
+            dummy_target_instance_pose = torch.eye(4).reshape(1, 1, 1, 4, 4).repeat(b, tgt_t, 1, 1, 1).to(probabilities)
+
+            ### bbox not related to time
+            context_instance_poses = torch.cat([dummy_context_instance_pose, data_dict['context_instances_pose']], dim=2)
+            target_instance_poses = torch.cat([dummy_target_instance_pose, data_dict['target_instances_pose']], dim=2)
+            valid_pose = (
+                data_dict['context_instances_id'][:, :, None].bool()
+                & data_dict['target_instances_id'][:, None].bool()
+            )
+            data_dict['bbox_valid_count'] = data_dict['context_instances_id'].sum()
+            if valid_pose.any():
+                context_pose = data_dict['context_instances_pose'][:, :, None]
+                target_pose = data_dict['target_instances_pose'][:, None]
+                pose_translation = (
+                    target_pose[..., :3, 3] - context_pose[..., :3, 3]
+                ).norm(dim=-1)[valid_pose]
+                relative_rotation = (
+                    target_pose[..., :3, :3]
+                    @ context_pose[..., :3, :3].transpose(-2, -1)
+                )
+                pose_yaw = torch.rad2deg(torch.atan2(
+                    relative_rotation[..., 1, 0], relative_rotation[..., 0, 0]
+                ).abs())[valid_pose]
+                data_dict['bbox_pose_mean_translation'] = pose_translation.mean()
+                data_dict['bbox_pose_max_translation'] = pose_translation.max()
+                data_dict['bbox_pose_mean_rotation_deg'] = pose_yaw.mean()
+                data_dict['bbox_pose_max_rotation_deg'] = pose_yaw.max()
+            transformed_means = transform_gaussian_means_with_instances(
+                context_instance_poses,  # [B, T_context, N_box, 4, 4]
+                target_instance_poses,   # [B, T_target, N_box, 4, 4]
+                t_means,                   # [B, T_context, N_gs, 3]
+                probabilities,          # [B, T_context, N_gs, N_box]
+                stable_delta=getattr(self.args, "stable_bbox_delta_transform", False),
+            )
+            data_dict['bbox_motion_mean_displacement'] = (
+                transformed_means - t_means[:, None]
+            ).norm(dim=-1).mean()
+            data_dict['bbox_motion_max_displacement'] = (
+                transformed_means - t_means[:, None]
+            ).norm(dim=-1).max()
+
+            transformed_means = rearrange(transformed_means, "b t v n c -> (b t) (v n) c")
+            transformed_quats = None
+            if self.args.paper_bbox_rotation:
+                t_quats = rearrange(gs_params["quats"], "b t v h w c -> b t (v h w) c")
+                transformed_quats = transform_gaussian_quats_with_instances(
+                    context_instance_poses, target_instance_poses, t_quats, probabilities
+                )
+                transformed_quats = rearrange(transformed_quats, "b t v n c -> (b t) (v n) c")
 
 
         ntk_dynamic = forward_v.shape[1]
@@ -2073,14 +2106,90 @@ class UFO(ViT):
 
         ctx_time = data_dict["gs_time"] * data_dict["timespan"]
         tgt_time = data_dict["target_time"] * data_dict["timespan"]
-        if tgt_time.ndim == 3:
-            tdiff_forward = tgt_time.unsqueeze(2) - ctx_time.unsqueeze(1)
-            tdiff_forward = tdiff_forward.view(b * tgt_t, t * v, 1)
-            tdiff_forward_batched = tdiff_forward.repeat_interleave(h * w, dim=1)
+
+        if (
+            renderer_mode
+            == "sam_object_fusion"
+        ):
+            source_time = gs_params.get(
+                "r6_source_time_seconds"
+            )
+
+            if source_time is None:
+                raise RuntimeError(
+                    "R6 renderer requires "
+                    "r6_source_time_seconds"
+                )
+
+            source_time = (
+                source_time.reshape(
+                    b,
+                    -1,
+                )
+            )
+
+            # Target timestamps are identical across
+            # cameras at one Waymo timestep.
+            if tgt_time.ndim == 3:
+                target_scalar_time = (
+                    tgt_time[..., 0]
+                )
+            else:
+                target_scalar_time = (
+                    tgt_time
+                )
+
+            tdiff_forward_batched = (
+                target_scalar_time[
+                    ...,
+                    None,
+                ]
+                - source_time[:, None]
+            ).reshape(
+                b * tgt_t,
+                -1,
+                1,
+            )
+
+        elif tgt_time.ndim == 3:
+            tdiff_forward = (
+                tgt_time.unsqueeze(2)
+                - ctx_time.unsqueeze(1)
+            )
+            tdiff_forward = (
+                tdiff_forward.view(
+                    b * tgt_t,
+                    t * v,
+                    1,
+                )
+            )
+            tdiff_forward_batched = (
+                tdiff_forward
+                .repeat_interleave(
+                    h * w,
+                    dim=1,
+                )
+            )
+
         else:
-            tdiff_forward = tgt_time.unsqueeze(-1) - ctx_time.unsqueeze(-2)
-            tdiff_forward = tdiff_forward.view(b * tgt_t, t, 1)
-            tdiff_forward_batched = tdiff_forward.repeat_interleave(v * h * w, dim=1)
+            tdiff_forward = (
+                tgt_time.unsqueeze(-1)
+                - ctx_time.unsqueeze(-2)
+            )
+            tdiff_forward = (
+                tdiff_forward.view(
+                    b * tgt_t,
+                    t,
+                    1,
+                )
+            )
+            tdiff_forward_batched = (
+                tdiff_forward
+                .repeat_interleave(
+                    v * h * w,
+                    dim=1,
+                )
+            )
         if not static_only and not self.static:
             forward_translation = forward_v_batched[:, :ntk_dynamic] * tdiff_forward_batched
             means_batched[:, :ntk_dynamic] = means_batched[:, :ntk_dynamic] + forward_translation
@@ -2146,7 +2255,11 @@ class UFO(ViT):
             # --------------------------------------------------
             if (
                 renderer_mode
-                in ("sam_object_motion", "sam_object_canonical")
+                in (
+                    "sam_object_motion",
+                    "sam_object_canonical",
+                    "sam_object_fusion",
+                )
                 and sam_track_ids_dense
                 is not None
             ):
@@ -2191,7 +2304,24 @@ class UFO(ViT):
 
         if not self.training:
 
-            weights_batched = rearrange(probabilities, "b v n c -> b (v n) c").repeat(tgt_t, 1, 1)
+            if probabilities is None:
+                weights_batched = (
+                    forward_v_batched.new_zeros(
+                        b * tgt_t,
+                        means.shape[1],
+                        1 + self.num_bbox,
+                    )
+                )
+                weights_batched[..., 0] = 1.0
+            else:
+                weights_batched = rearrange(
+                    probabilities,
+                    "b v n c -> b (v n) c",
+                ).repeat(
+                    tgt_t,
+                    1,
+                    1,
+                )
 
             # Include lifespan for visualization (1 channel)
             colors_batched = torch.cat([color_batched, forward_v_batched, lifespan_batched, weights_batched], dim=-1)
@@ -2524,7 +2654,143 @@ class UFO(ViT):
 
         dynamic_mode = getattr(self.args, "dynamic_renderer_mode", "bbox")
 
-        if dynamic_mode == "sam_object_canonical":
+        if dynamic_mode == "sam_object_fusion":
+
+            # During recurrent scene construction we only
+            # need Gaussian geometry for token locations.
+            # Running global association/fusion here would
+            # repeat it once per chunk for no benefit.
+            if data_dict.get(
+                "_r6_scene_update_only",
+                False,
+            ):
+                data_dict["class_loss"] = (
+                    x.sum() * 0.0
+                )
+
+                data_dict["gs_params"] = (
+                    gs_params
+                )
+
+                return data_dict
+
+            from ufo.models.sam_object_motion_r6 import (
+                predict_sam_fused_motion,
+            )
+
+            if (
+                self.sam_object_motion_head
+                is None
+            ):
+                raise RuntimeError(
+                    "R6 object motion head missing"
+                )
+
+            (
+                forward_flow,
+                global_track_ids,
+                fused_params,
+                r6_diag,
+            ) = predict_sam_fused_motion(
+                gs_state=x,
+                gs_params=gs_params,
+                local_track_ids=(
+                    data_dict.get(
+                        "sam_track_ids"
+                    )
+                ),
+                gs_time=data_dict[
+                    "gs_time"
+                ],
+                timespan=data_dict[
+                    "timespan"
+                ],
+                motion_head=(
+                    self.sam_object_motion_head
+                ),
+                patch_size=self.unpatch_size,
+                min_observations=getattr(
+                    self.args,
+                    "sam_motion_min_observations",
+                    2,
+                ),
+                min_track_pixels=getattr(
+                    self.args,
+                    "sam_r5_min_track_pixels",
+                    16,
+                ),
+                association_max_distance=getattr(
+                    self.args,
+                    "sam_r5_association_max_distance",
+                    4.0,
+                ),
+                association_min_overlap=getattr(
+                    self.args,
+                    "sam_r5_association_min_overlap",
+                    1,
+                ),
+                voxel_size=getattr(
+                    self.args,
+                    "sam_r6_voxel_size",
+                    0.12,
+                ),
+                min_voxel_support=getattr(
+                    self.args,
+                    "sam_r6_min_voxel_support",
+                    1,
+                ),
+            )
+
+            for key in (
+                "means",
+                "scales",
+                "quats",
+                "opacities",
+                "colors",
+            ):
+                gs_params[key] = (
+                    fused_params[key]
+                )
+
+            gs_params["forward_flow"] = (
+                forward_flow
+            )
+
+            gs_params[
+                "r6_global_track_ids"
+            ] = global_track_ids
+
+            gs_params[
+                "r6_source_time_seconds"
+            ] = fused_params[
+                "source_time_seconds"
+            ]
+
+            gs_params[
+                "r6_active_mask"
+            ] = fused_params[
+                "active_mask"
+            ]
+
+            # R6 has no bbox/object-assignment branch.
+            data_dict["class_loss"] = (
+                x.sum() * 0.0
+            )
+
+            for key, value in (
+                r6_diag.items()
+            ):
+                if torch.is_tensor(value):
+                    data_dict[key] = value
+                else:
+                    data_dict[key] = (
+                        torch.tensor(
+                            float(value),
+                            device=x.device,
+                        )
+                    )
+
+        elif dynamic_mode == "sam_object_canonical":
 
             from ufo.models.sam_object_motion_r5 import (
                 predict_sam_canonical_motion,
