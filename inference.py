@@ -247,6 +247,16 @@ def concatenate_chunk_targets(inout_dicts):
         values = [input_dict[key] for input_dict, _ in inout_dicts]
         render_input[key] = torch.cat(values, dim=1)
 
+    # Preserve all recurrent RGB observations for R9's
+    # motion-aligned feature/appearance fusion.
+    render_input["r9_context_image"] = torch.cat(
+        [
+            input_dict["context_image"]
+            for input_dict, _ in inout_dicts
+        ],
+        dim=1,
+    )
+
     target_dict = {}
     for key in inout_dicts[0][1]:
         values = [chunk_target[key] for _, chunk_target in inout_dicts]

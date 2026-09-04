@@ -182,6 +182,15 @@ def gaussian_metrics(output_dict, max_scale=None):
         "renderer_local_nearest_bbox_distance_min",
         "renderer_global_local_bbox_center_delta_mean",
         "renderer_global_local_bbox_center_delta_max",
+        "r9_object_count",
+        "r9_dynamic_input_points",
+        "r9_fused_voxel_count",
+        "r9_fusion_ratio",
+        "r9_voxel_support_mean",
+        "r9_fusion_entropy_mean",
+        "r9_temporal_span_mean",
+        "r9_mean_residual_abs",
+        "r9_color_residual_abs",
     ):
         if key in output_dict:
             result[key] = output_dict[key].detach().float().item()
@@ -230,6 +239,8 @@ def parameter_grad_norms(model):
         "bbox_head_grad_norm": ("bbox_embed", "bbox_query_head", "bbox_key_head"),
         "lifespan_head_grad_norm": ("gs_life_pred",),
         "affine_grad_norm": ("affine_linear", "affine_token"),
+        "sam_motion_grad_norm": ("sam_object_motion_head",),
+        "r9_detail_grad_norm": ("sam_object_detail_head",),
     }
     result = {}
     named = list(model.named_parameters())

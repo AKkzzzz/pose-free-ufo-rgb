@@ -306,6 +306,21 @@ def get_args_parser():
         action="store_true",
     )
     parser.add_argument(
+        "--sam_canonical_fusion_impl",
+        choices=["gaussian_average", "feature_fusion"],
+        default="gaussian_average",
+        help="R6 Gaussian averaging or R9 feature-level canonical fusion.",
+    )
+    parser.add_argument("--sam_r9_hidden_dim", type=int, default=256)
+    parser.add_argument("--sam_r9_voxel_size", type=float, default=0.12)
+    parser.add_argument("--sam_r9_min_voxel_support", type=int, default=1)
+    parser.add_argument("--sam_r9_max_mean_residual", type=float, default=0.08)
+    parser.add_argument("--sam_r9_max_log_scale_residual", type=float, default=0.35)
+    parser.add_argument("--sam_r9_max_quat_residual", type=float, default=0.20)
+    parser.add_argument("--sam_r9_max_color_residual", type=float, default=0.25)
+    parser.add_argument("--sam_r9_spatial_prior", type=float, default=0.50)
+    parser.add_argument("--sam_r9_temporal_prior", type=float, default=0.25)
+    parser.add_argument(
         "--sam_object_edge_weight",
         type=float,
         default=0.0,
@@ -1646,6 +1661,23 @@ def main(args):
                     r6_stage2_input.update(
                         all_gs_features
                     )
+
+                    # R9 feature fusion requires RGB evidence aligned
+                    # one-to-one with the accumulated recurrent GS state.
+                    # final_scene_inputs is already in recurrent processing
+                    # order, exactly matching all_gs_features.
+                    if getattr(
+                        args,
+                        "sam_canonical_fusion_impl",
+                        "gaussian_average",
+                    ) == "feature_fusion":
+                        r6_stage2_input["r9_context_image"] = torch.cat(
+                            [
+                                chunk_input["context_image"]
+                                for chunk_input, _ in final_scene_inputs
+                            ],
+                            dim=1,
+                        )
 
                     r6_cached_stage2 = model(
                         r6_stage2_input,

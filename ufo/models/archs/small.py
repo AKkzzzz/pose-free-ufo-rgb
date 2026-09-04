@@ -712,6 +712,35 @@ class UFO(ViT):
                 )
             )
 
+        self.sam_object_detail_head = None
+        if (
+            dynamic_mode_init == "sam_object_fusion"
+            and getattr(
+                args, "sam_canonical_fusion_impl", "gaussian_average"
+            ) == "feature_fusion"
+        ):
+            from ufo.models.sam_object_detail_r9 import (
+                SAMObjectDetailFusionHead,
+            )
+
+            self.sam_object_detail_head = SAMObjectDetailFusionHead(
+                embed_dim=embed_dim,
+                color_dim=gs_dim,
+                hidden_dim=getattr(args, "sam_r9_hidden_dim", 256),
+                max_mean_residual=getattr(
+                    args, "sam_r9_max_mean_residual", 0.08
+                ),
+                max_log_scale_residual=getattr(
+                    args, "sam_r9_max_log_scale_residual", 0.35
+                ),
+                max_quat_residual=getattr(
+                    args, "sam_r9_max_quat_residual", 0.20
+                ),
+                max_color_residual=getattr(
+                    args, "sam_r9_max_color_residual", 0.25
+                ),
+            )
+
         self.num_heads = num_heads
 
         self.static = static
@@ -2674,72 +2703,110 @@ class UFO(ViT):
 
                 return data_dict
 
-            from ufo.models.sam_object_motion_r6 import (
-                predict_sam_fused_motion,
+            if self.sam_object_motion_head is None:
+                raise RuntimeError("canonical object motion head missing")
+
+            fusion_impl = getattr(
+                self.args,
+                "sam_canonical_fusion_impl",
+                "gaussian_average",
             )
 
-            if (
-                self.sam_object_motion_head
-                is None
-            ):
-                raise RuntimeError(
-                    "R6 object motion head missing"
+            if fusion_impl == "feature_fusion":
+                from ufo.models.sam_object_detail_r9 import (
+                    predict_sam_detail_motion,
                 )
 
-            (
-                forward_flow,
-                global_track_ids,
-                fused_params,
-                r6_diag,
-            ) = predict_sam_fused_motion(
-                gs_state=x,
-                gs_params=gs_params,
-                local_track_ids=(
-                    data_dict.get(
-                        "sam_track_ids"
+                if self.sam_object_detail_head is None:
+                    raise RuntimeError(
+                        "R9 detail fusion head was not initialized"
                     )
-                ),
-                gs_time=data_dict[
-                    "gs_time"
-                ],
-                timespan=data_dict[
-                    "timespan"
-                ],
-                motion_head=(
-                    self.sam_object_motion_head
-                ),
-                patch_size=self.unpatch_size,
-                min_observations=getattr(
-                    self.args,
-                    "sam_motion_min_observations",
-                    2,
-                ),
-                min_track_pixels=getattr(
-                    self.args,
-                    "sam_r5_min_track_pixels",
-                    16,
-                ),
-                association_max_distance=getattr(
-                    self.args,
-                    "sam_r5_association_max_distance",
-                    4.0,
-                ),
-                association_min_overlap=getattr(
-                    self.args,
-                    "sam_r5_association_min_overlap",
-                    1,
-                ),
-                voxel_size=getattr(
-                    self.args,
-                    "sam_r6_voxel_size",
-                    0.12,
-                ),
-                min_voxel_support=getattr(
-                    self.args,
-                    "sam_r6_min_voxel_support",
-                    1,
-                ),
-            )
+
+                (
+                    forward_flow,
+                    global_track_ids,
+                    fused_params,
+                    r6_diag,
+                ) = predict_sam_detail_motion(
+                    gs_state=x,
+                    gs_params=gs_params,
+                    context_image=data_dict.get(
+                        "r9_context_image",
+                        data_dict["context_image"],
+                    ),
+                    local_track_ids=data_dict.get("sam_track_ids"),
+                    gs_time=data_dict["gs_time"],
+                    timespan=data_dict["timespan"],
+                    motion_head=self.sam_object_motion_head,
+                    detail_head=self.sam_object_detail_head,
+                    patch_size=self.unpatch_size,
+                    min_observations=getattr(
+                        self.args, "sam_motion_min_observations", 2
+                    ),
+                    min_track_pixels=getattr(
+                        self.args, "sam_r5_min_track_pixels", 16
+                    ),
+                    association_max_distance=getattr(
+                        self.args, "sam_r5_association_max_distance", 4.0
+                    ),
+                    association_min_overlap=getattr(
+                        self.args, "sam_r5_association_min_overlap", 1
+                    ),
+                    voxel_size=getattr(
+                        self.args, "sam_r9_voxel_size", 0.12
+                    ),
+                    min_voxel_support=getattr(
+                        self.args, "sam_r9_min_voxel_support", 1
+                    ),
+                    spatial_prior=getattr(
+                        self.args, "sam_r9_spatial_prior", 0.50
+                    ),
+                    temporal_prior=getattr(
+                        self.args, "sam_r9_temporal_prior", 0.25
+                    ),
+                )
+
+            elif fusion_impl == "gaussian_average":
+                from ufo.models.sam_object_motion_r6 import (
+                    predict_sam_fused_motion,
+                )
+
+                (
+                    forward_flow,
+                    global_track_ids,
+                    fused_params,
+                    r6_diag,
+                ) = predict_sam_fused_motion(
+                    gs_state=x,
+                    gs_params=gs_params,
+                    local_track_ids=data_dict.get("sam_track_ids"),
+                    gs_time=data_dict["gs_time"],
+                    timespan=data_dict["timespan"],
+                    motion_head=self.sam_object_motion_head,
+                    patch_size=self.unpatch_size,
+                    min_observations=getattr(
+                        self.args, "sam_motion_min_observations", 2
+                    ),
+                    min_track_pixels=getattr(
+                        self.args, "sam_r5_min_track_pixels", 16
+                    ),
+                    association_max_distance=getattr(
+                        self.args, "sam_r5_association_max_distance", 4.0
+                    ),
+                    association_min_overlap=getattr(
+                        self.args, "sam_r5_association_min_overlap", 1
+                    ),
+                    voxel_size=getattr(
+                        self.args, "sam_r6_voxel_size", 0.12
+                    ),
+                    min_voxel_support=getattr(
+                        self.args, "sam_r6_min_voxel_support", 1
+                    ),
+                )
+            else:
+                raise ValueError(
+                    f"unknown sam_canonical_fusion_impl={fusion_impl!r}"
+                )
 
             for key in (
                 "means",
