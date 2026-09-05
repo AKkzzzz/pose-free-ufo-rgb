@@ -26,6 +26,7 @@ test -x "${UFO_TORCHRUN_BIN}" || { echo "Missing torchrun: ${UFO_TORCHRUN_BIN}" 
 export UFO_EXPECTED_TORCH="${UFO_EXPECTED_TORCH:-2.10.0+cu128}"
 export UFO_EXPECTED_TORCH_CUDA="${UFO_EXPECTED_TORCH_CUDA:-12.8}"
 export UFO_OFFLINE=1
+export HF_HOME="${HF_HOME:-${UFO_ROOT}/third_party/hf_cache}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export WANDB_MODE=offline

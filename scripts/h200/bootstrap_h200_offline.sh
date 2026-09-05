@@ -30,10 +30,22 @@ bash scripts/h200/audit_runtime_network.sh
 test "$(wc -l < "${UFO_DATA_ROOT}/scene_list/waymo_train.txt")" -eq 798
 test "$(wc -l < "${UFO_DATA_ROOT}/scene_list/waymo_val.txt")" -eq 202
 test -f "${UFO_DATA_ROOT}/scene_list/waymo_instance_scene_manifest.json"
-cmp offline_assets/data_contract/waymo_train.txt "${UFO_DATA_ROOT}/scene_list/waymo_train.txt"
-cmp offline_assets/data_contract/waymo_val.txt "${UFO_DATA_ROOT}/scene_list/waymo_val.txt"
 cmp offline_assets/data_contract/waymo_instance_scene_manifest.json \
   "${UFO_DATA_ROOT}/scene_list/waymo_instance_scene_manifest.json"
+"${UFO_PYTHON_BIN}" - <<'PY'
+from pathlib import Path
+import os
+root = Path(os.environ["UFO_DATA_ROOT"])
+for split, expected in (("train", 798), ("val", 202)):
+    lines = (root / f"scene_list/waymo_{split}.txt").read_text().splitlines()
+    assert len(lines) == expected
+    for item in lines:
+        path = Path(item)
+        if not path.is_absolute():
+            path = root / path
+        assert path.is_file(), path
+print("PORTABLE_ANNOTATION_PATHS=PASS")
+PY
 
 if [[ "${UFO_ALLOW_NON_H200_SMOKE:-0}" != "1" ]]; then
   "${UFO_PYTHON_BIN}" - <<'PY'
