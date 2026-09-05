@@ -12,7 +12,22 @@ OUTPUT = ROOT / "outputs/r9_h200_profile"
 CANDIDATES = ((8, 1), (4, 2), (2, 4), (1, 8))
 
 
+def optimizer_cycle_seconds(measured):
+    return measured["compute_step_seconds_mean"]
+
+
+def validate_candidates():
+    for batch, accumulation in CANDIDATES:
+        global_batch = 8 * batch * accumulation
+        if global_batch != 64:
+            raise RuntimeError(
+                f"Invalid benchmark candidate b{batch}a{accumulation}: "
+                f"global_batch={global_batch}"
+            )
+
+
 def main():
+    validate_candidates()
     torchrun = Path("/root/miniconda3/envs/dggt_data/bin/torchrun")
     OUTPUT.mkdir(parents=True, exist_ok=True)
     results = []
@@ -42,11 +57,7 @@ def main():
         if completed.returncode == 0 and timing.is_file():
             measured = json.loads(timing.read_text())
             result.update(measured)
-            result["optimizer_step_seconds"] = (
-                measured["forward_seconds_mean"] * accumulation
-                + measured["backward_seconds_mean"] * accumulation
-                + measured["optimizer_seconds_mean"]
-            )
+            result["optimizer_step_seconds"] = optimizer_cycle_seconds(measured)
             result["status"] = "PASS"
         else:
             log_text = (run / "stdout.log").read_text(errors="ignore")

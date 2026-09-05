@@ -12,6 +12,9 @@ CORE=(
   ufo/dataset/data_utils.py
   ufo/dataset/sam_tracks.py
   inference.py
+  main.py
+  ufo/utils/misc.py
+  ufo/utils/config.py
 )
 cd "${ROOT}"
 diff_output="$(git diff "${BASE}" -- "${CORE[@]}")"

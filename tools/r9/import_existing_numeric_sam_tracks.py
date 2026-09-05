@@ -75,7 +75,7 @@ def main():
     parser.add_argument("--sam-root", type=Path, default=ROOT / "data/r9_sam_tracks")
     parser.add_argument("--scene-index", type=int)
     args = parser.parse_args()
-    imported = skipped = 0
+    imported = skipped = kept = invalid_existing = 0
     for index, scene_name in annotations(args.data_root):
         if args.scene_index is not None and index != args.scene_index:
             continue
@@ -83,21 +83,50 @@ def main():
         for camera in CAMERAS:
             source = args.sam_root / numeric / camera
             indices = frame_indices(args.data_root, numeric, camera)
-            if not valid_pair(source, indices):
-                skipped += 1
-                continue
             scene_dir = args.sam_root / scene_name
-            scene_dir.mkdir(exist_ok=True)
             alias = scene_dir / camera
             if alias.exists() or alias.is_symlink():
                 if alias.is_symlink() and alias.resolve() == source.resolve():
-                    imported += 1
+                    if valid_pair(source, indices):
+                        imported += 1
+                    else:
+                        invalid_existing += 1
+                        print(
+                            f"INVALID_EXISTING scene={scene_name} camera={camera} "
+                            f"path={alias} action=leave_for_preprocess"
+                        )
                     continue
-                raise RuntimeError(f"Refusing to replace existing alias: {alias}")
+                if alias.is_dir() and not alias.is_symlink():
+                    if valid_pair(alias, indices):
+                        kept += 1
+                        print(
+                            f"KEEP_EXISTING scene={scene_name} camera={camera} "
+                            f"path={alias}"
+                        )
+                    else:
+                        invalid_existing += 1
+                        print(
+                            f"INVALID_EXISTING scene={scene_name} camera={camera} "
+                            f"path={alias} action=leave_for_preprocess"
+                        )
+                    continue
+                invalid_existing += 1
+                print(
+                    f"INVALID_EXISTING scene={scene_name} camera={camera} "
+                    f"path={alias} action=leave_for_preprocess"
+                )
+                continue
+            if not valid_pair(source, indices):
+                skipped += 1
+                continue
+            scene_dir.mkdir(exist_ok=True)
             relative = os.path.relpath(source, scene_dir)
             alias.symlink_to(relative, target_is_directory=True)
             imported += 1
-    print(f"SAM_NUMERIC_IMPORT imported_pairs={imported} skipped_pairs={skipped}")
+    print(
+        f"SAM_NUMERIC_IMPORT imported_pairs={imported} skipped_pairs={skipped} "
+        f"kept_existing_pairs={kept} invalid_existing_pairs={invalid_existing}"
+    )
 
 
 if __name__ == "__main__":

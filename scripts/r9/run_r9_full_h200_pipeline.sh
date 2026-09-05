@@ -17,7 +17,7 @@ if [[ "${R9_PIPELINE_DRY_RUN:-0}" == "1" ]]; then
   echo "STEP7 bash scripts/r9/smoke_r9_h200_ddp.sh"
   echo "STEP8 bash scripts/r9/benchmark_r9_h200.sh"
   echo "STEP9 source outputs/r9_h200_profile/recommended.env"
-  echo "STEP10 print GPU,batch/GPU,accum,global_batch=64,iterations=100000,SAM=data/r9_sam_tracks,output=outputs/full_100k"
+  echo "STEP10 print GPU,batch/GPU,accum,global_batch=64,iterations=100000,SAM=data/r9_sam_tracks,output=outputs/full_100k/r9_waymo_full_100k"
   echo "STEP11 bash scripts/r9/train_r9_waymo_full_h200.sh"
   echo "R9_PIPELINE_DRY_RUN=PASS"
   exit 0
@@ -55,6 +55,6 @@ echo "accumulation_steps=${R9_ACCUMULATION_STEPS}"
 echo "global_batch=$((8 * R9_BATCH_SIZE * R9_ACCUMULATION_STEPS))"
 echo "iterations=100000"
 echo "sam_root=${ROOT}/data/r9_sam_tracks"
-echo "output=${ROOT}/outputs/full_100k"
+echo "output=${ROOT}/outputs/full_100k/r9_waymo_full_100k"
 echo "STEP11 foreground Full Waymo R9 100k"
 exec bash scripts/r9/train_r9_waymo_full_h200.sh
